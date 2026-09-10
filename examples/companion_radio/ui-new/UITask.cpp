@@ -38,8 +38,12 @@
   #define UI_PING_TEXT  "Ping"
 #endif
 
-// the YO page sends this text as a direct message to a node picked from the
+// the YO page sends one of these as a direct message, to a node picked from the
 // recently-heard list
+static const char* const UI_YO_MESSAGES[] = { "YO", "Yes", "No", "OK", "Boom" };
+#define UI_YO_NUM_MESSAGES  ((int)(sizeof(UI_YO_MESSAGES) / sizeof(UI_YO_MESSAGES[0])))
+
+// label for the page itself
 #ifndef UI_YO_TEXT
   #define UI_YO_TEXT  "YO"
 #endif
@@ -130,10 +134,41 @@ class HomeScreen : public UIScreen {
   bool _shutdown_init;
   AdvertPath recent[UI_RECENT_LIST_SIZE];
 
-  // YO page node picker state
-  bool _yo_picking;                    // picker is up, and is consuming all input
+  // YO page state: pick a node, then pick what to say to it
+  enum YoStage { YO_IDLE = 0, YO_PICK_NODE, YO_PICK_MSG };
+  uint8_t _yo_stage;
   int _yo_num, _yo_sel;                // nodes in the snapshot, and which one is selected
+  int _yo_msg;                         // index into UI_YO_MESSAGES
   AdvertPath _yo_nodes[UI_YO_LIST_SIZE];
+
+  void sendYo() {
+    auto node = &_yo_nodes[_yo_sel];
+    const char* text = UI_YO_MESSAGES[_yo_msg];
+    char alert[52];
+
+    _task->notify(UIEventType::ack);
+    switch (the_mesh.sendTextToNode(node->pubkey_prefix, sizeof(node->pubkey_prefix), text)) {
+      case MyMesh::NODE_TXT_OK:
+        snprintf(alert, sizeof(alert), "%s -> %s", text, node->name);
+        _task->showAlert(alert, 1500);
+        break;
+      case MyMesh::NODE_TXT_NO_CONTACT:
+        _task->showAlert("Not a contact", 1500);
+        break;
+      default:
+        snprintf(alert, sizeof(alert), "%s failed..", text);
+        _task->showAlert(alert, 1000);
+        break;
+    }
+  }
+
+  // one row of a picker list: '>' marker on the selection, name ellipsized to fit
+  void drawPickerRow(DisplayDriver& display, int y, bool is_sel, const char* text) {
+    display.setColor(is_sel ? UIColor::warning_txt : UIColor::secondary_txt);
+    display.setCursor(0, y);
+    display.print(is_sel ? ">" : " ");
+    display.drawTextEllipsized(8, y, display.width() - 8, text);
+  }
 
   // Snapshot the recently-heard nodes. Taking a copy matters: getRecentlyHeard() re-sorts the
   // live table on every call, so reading it again between "select" and "send" could shift the
@@ -220,7 +255,8 @@ class HomeScreen : public UIScreen {
 public:
   HomeScreen(UITask* task, mesh::RTCClock* rtc, SensorManager* sensors, NodePrefs* node_prefs)
      : _task(task), _rtc(rtc), _sensors(sensors), _node_prefs(node_prefs), _page(0),
-       _shutdown_init(false), _yo_picking(false), _yo_num(0), _yo_sel(0), sensors_lpp(200) {  }
+       _shutdown_init(false), _yo_stage(YO_IDLE), _yo_num(0), _yo_sel(0), _yo_msg(0),
+       sensors_lpp(200) {  }
 
   void poll() override {
     if (_shutdown_init && !_task->isButtonPressed()) {  // must wait for USR button to be released
@@ -345,21 +381,33 @@ public:
       display.setColor(UIColor::secondary_txt);
       display.drawTextCentered(display.width() / 2, 64 - 11, "#" UI_PING_CHANNEL_NAME ": " PRESS_LABEL);
     } else if (_page == HomePage::YO) {
-      if (_yo_picking) {
+      char filtered_name[sizeof(_yo_nodes[0].name)];
+      if (_yo_stage == YO_PICK_NODE) {
         // scroll the window so the selection is always the last visible row
         int first = _yo_sel - (UI_YO_VISIBLE_ROWS - 1);
         if (first < 0) first = 0;
 
         int y = 20;
         for (int i = first; i < _yo_num && i < first + UI_YO_VISIBLE_ROWS; i++, y += 11) {
-          bool is_sel = (i == _yo_sel);
-          display.setColor(is_sel ? UIColor::warning_txt : UIColor::secondary_txt);
-          display.setCursor(0, y);
-          display.print(is_sel ? ">" : " ");
-
-          char filtered_name[sizeof(_yo_nodes[i].name)];
           display.translateUTF8ToBlocks(filtered_name, _yo_nodes[i].name, sizeof(filtered_name));
-          display.drawTextEllipsized(8, y, display.width() - 8, filtered_name);
+          drawPickerRow(display, y, i == _yo_sel, filtered_name);
+        }
+      } else if (_yo_stage == YO_PICK_MSG) {
+        // header: who this is going to, so the target is still visible while choosing
+        display.setColor(UIColor::primary_txt);
+        display.setCursor(0, 20);
+        display.print("->");
+        display.translateUTF8ToBlocks(filtered_name, _yo_nodes[_yo_sel].name,
+                                      sizeof(filtered_name));
+        display.drawTextEllipsized(16, 20, display.width() - 16, filtered_name);
+
+        const int rows = UI_YO_VISIBLE_ROWS - 1;   // header takes one row
+        int first = _yo_msg - (rows - 1);
+        if (first < 0) first = 0;
+
+        int y = 31;
+        for (int i = first; i < UI_YO_NUM_MESSAGES && i < first + rows; i++, y += 11) {
+          drawPickerRow(display, y, i == _yo_msg, UI_YO_MESSAGES[i]);
         }
       } else {
         display.setColor(UIColor::corp_blue);
@@ -505,32 +553,27 @@ public:
   }
 
   bool handleInput(char c) override {
-    // the YO node picker is modal -- it swallows every key, so that a short press steps
-    // through the nodes instead of paging the carousel
-    if (_yo_picking) {
+    // the YO pickers are modal -- they swallow every key, so that a short press steps through
+    // the list instead of paging the carousel
+    if (_yo_stage == YO_PICK_NODE) {
       if (c == KEY_NEXT || c == KEY_RIGHT) {   // short press -> next node
         _yo_sel = (_yo_sel + 1) % _yo_num;
       } else if (c == KEY_PREV || c == KEY_LEFT) {   // double-click -> back out
-        _yo_picking = false;
+        _yo_stage = YO_IDLE;
+      } else if (c == KEY_ENTER) {   // long press -> now choose what to say
+        _yo_msg = 0;
+        _yo_stage = YO_PICK_MSG;
+      }
+      return true;
+    }
+    if (_yo_stage == YO_PICK_MSG) {
+      if (c == KEY_NEXT || c == KEY_RIGHT) {   // short press -> next message
+        _yo_msg = (_yo_msg + 1) % UI_YO_NUM_MESSAGES;
+      } else if (c == KEY_PREV || c == KEY_LEFT) {   // double-click -> back to the node list
+        _yo_stage = YO_PICK_NODE;
       } else if (c == KEY_ENTER) {   // long press -> send
-        auto node = &_yo_nodes[_yo_sel];
-        _task->notify(UIEventType::ack);
-        switch (the_mesh.sendTextToNode(node->pubkey_prefix, sizeof(node->pubkey_prefix),
-                                        UI_YO_TEXT)) {
-          case MyMesh::NODE_TXT_OK: {
-            char msg[48];
-            snprintf(msg, sizeof(msg), UI_YO_TEXT " -> %s", node->name);
-            _task->showAlert(msg, 1500);
-            break;
-          }
-          case MyMesh::NODE_TXT_NO_CONTACT:
-            _task->showAlert("Not a contact", 1500);
-            break;
-          default:
-            _task->showAlert(UI_YO_TEXT " failed..", 1000);
-            break;
-        }
-        _yo_picking = false;
+        sendYo();
+        _yo_stage = YO_IDLE;
       }
       return true;
     }
@@ -582,7 +625,7 @@ public:
       if (_yo_num == 0) {
         _task->showAlert("No recent nodes", 1200);
       } else {
-        _yo_picking = true;
+        _yo_stage = YO_PICK_NODE;
       }
       return true;
     }
