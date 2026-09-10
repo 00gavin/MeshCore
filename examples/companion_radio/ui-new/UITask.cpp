@@ -38,6 +38,16 @@
   #define UI_PING_TEXT  "Ping"
 #endif
 
+// the YO page sends this text as a direct message to a node picked from the
+// recently-heard list
+#ifndef UI_YO_TEXT
+  #define UI_YO_TEXT  "YO"
+#endif
+#ifndef UI_YO_LIST_SIZE
+  #define UI_YO_LIST_SIZE  8
+#endif
+#define UI_YO_VISIBLE_ROWS  4   // rows that fit under the title bar
+
 #include "icons.h"
 
 class SplashScreen : public UIScreen {
@@ -101,6 +111,7 @@ class HomeScreen : public UIScreen {
     BLUETOOTH,
     ADVERT,
     PING,
+    YO,
 #if ENV_INCLUDE_GPS == 1
     GPS,
 #endif
@@ -118,6 +129,25 @@ class HomeScreen : public UIScreen {
   uint8_t _page;
   bool _shutdown_init;
   AdvertPath recent[UI_RECENT_LIST_SIZE];
+
+  // YO page node picker state
+  bool _yo_picking;                    // picker is up, and is consuming all input
+  int _yo_num, _yo_sel;                // nodes in the snapshot, and which one is selected
+  AdvertPath _yo_nodes[UI_YO_LIST_SIZE];
+
+  // Snapshot the recently-heard nodes. Taking a copy matters: getRecentlyHeard() re-sorts the
+  // live table on every call, so reading it again between "select" and "send" could shift the
+  // list under the user and fire YO at the wrong node.
+  void yoTakeSnapshot() {
+    int n = the_mesh.getRecentlyHeard(_yo_nodes, UI_YO_LIST_SIZE);
+    _yo_num = 0;
+    for (int i = 0; i < n; i++) {
+      if (_yo_nodes[i].name[0] == 0) continue;   // empty slot
+      if (i != _yo_num) _yo_nodes[_yo_num] = _yo_nodes[i];
+      _yo_num++;
+    }
+    _yo_sel = 0;
+  }
 
 
   void renderBatteryIndicator(DisplayDriver& display, uint16_t batteryMilliVolts) {
@@ -190,7 +220,7 @@ class HomeScreen : public UIScreen {
 public:
   HomeScreen(UITask* task, mesh::RTCClock* rtc, SensorManager* sensors, NodePrefs* node_prefs)
      : _task(task), _rtc(rtc), _sensors(sensors), _node_prefs(node_prefs), _page(0),
-       _shutdown_init(false), sensors_lpp(200) {  }
+       _shutdown_init(false), _yo_picking(false), _yo_num(0), _yo_sel(0), sensors_lpp(200) {  }
 
   void poll() override {
     if (_shutdown_init && !_task->isButtonPressed()) {  // must wait for USR button to be released
@@ -314,6 +344,29 @@ public:
       display.drawXbm((display.width() - 32) / 2, 18, ping_icon, 32, 32);
       display.setColor(UIColor::secondary_txt);
       display.drawTextCentered(display.width() / 2, 64 - 11, "#" UI_PING_CHANNEL_NAME ": " PRESS_LABEL);
+    } else if (_page == HomePage::YO) {
+      if (_yo_picking) {
+        // scroll the window so the selection is always the last visible row
+        int first = _yo_sel - (UI_YO_VISIBLE_ROWS - 1);
+        if (first < 0) first = 0;
+
+        int y = 20;
+        for (int i = first; i < _yo_num && i < first + UI_YO_VISIBLE_ROWS; i++, y += 11) {
+          bool is_sel = (i == _yo_sel);
+          display.setColor(is_sel ? UIColor::warning_txt : UIColor::secondary_txt);
+          display.setCursor(0, y);
+          display.print(is_sel ? ">" : " ");
+
+          char filtered_name[sizeof(_yo_nodes[i].name)];
+          display.translateUTF8ToBlocks(filtered_name, _yo_nodes[i].name, sizeof(filtered_name));
+          display.drawTextEllipsized(8, y, display.width() - 8, filtered_name);
+        }
+      } else {
+        display.setColor(UIColor::corp_blue);
+        display.drawXbm((display.width() - 32) / 2, 18, rocket_icon, 32, 32);
+        display.setColor(UIColor::secondary_txt);
+        display.drawTextCentered(display.width() / 2, 64 - 11, UI_YO_TEXT ": " PRESS_LABEL);
+      }
 #if ENV_INCLUDE_GPS == 1
     } else if (_page == HomePage::GPS) {
       LocationProvider* nmea = sensors.getLocationProvider();
@@ -452,6 +505,35 @@ public:
   }
 
   bool handleInput(char c) override {
+    // the YO node picker is modal -- it swallows every key, so that a short press steps
+    // through the nodes instead of paging the carousel
+    if (_yo_picking) {
+      if (c == KEY_NEXT || c == KEY_RIGHT) {   // short press -> next node
+        _yo_sel = (_yo_sel + 1) % _yo_num;
+      } else if (c == KEY_PREV || c == KEY_LEFT) {   // double-click -> back out
+        _yo_picking = false;
+      } else if (c == KEY_ENTER) {   // long press -> send
+        auto node = &_yo_nodes[_yo_sel];
+        _task->notify(UIEventType::ack);
+        switch (the_mesh.sendTextToNode(node->pubkey_prefix, sizeof(node->pubkey_prefix),
+                                        UI_YO_TEXT)) {
+          case MyMesh::NODE_TXT_OK: {
+            char msg[48];
+            snprintf(msg, sizeof(msg), UI_YO_TEXT " -> %s", node->name);
+            _task->showAlert(msg, 1500);
+            break;
+          }
+          case MyMesh::NODE_TXT_NO_CONTACT:
+            _task->showAlert("Not a contact", 1500);
+            break;
+          default:
+            _task->showAlert(UI_YO_TEXT " failed..", 1000);
+            break;
+        }
+        _yo_picking = false;
+      }
+      return true;
+    }
     if (c == KEY_LEFT || c == KEY_PREV) {
       _page = (_page + HomePage::Count - 1) % HomePage::Count;
       return true;
@@ -492,6 +574,15 @@ public:
         default:
           _task->showAlert(UI_PING_TEXT " failed..", 1000);
           break;
+      }
+      return true;
+    }
+    if (c == KEY_ENTER && _page == HomePage::YO) {   // long press -> open the node picker
+      yoTakeSnapshot();
+      if (_yo_num == 0) {
+        _task->showAlert("No recent nodes", 1200);
+      } else {
+        _yo_picking = true;
       }
       return true;
     }

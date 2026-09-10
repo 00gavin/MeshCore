@@ -103,6 +103,10 @@ public:
   enum { CHANNEL_TXT_OK = 0, CHANNEL_TXT_NO_CHANNEL = 1, CHANNEL_TXT_SEND_FAILED = 2 };
   int sendTextToChannel(const char* channel_name, const char* text);
 
+  // result codes for sendTextToNode()
+  enum { NODE_TXT_OK = 0, NODE_TXT_NO_CONTACT = 1, NODE_TXT_SEND_FAILED = 2 };
+  int sendTextToNode(const uint8_t* pubkey_prefix, int prefix_len, const char* text);
+
   void enterCLIRescue();
 
   int  getRecentlyHeard(AdvertPath dest[], int max_num);

@@ -2284,6 +2284,30 @@ int MyMesh::sendTextToChannel(const char* channel_name, const char* text) {
   return CHANNEL_TXT_NO_CHANNEL;
 }
 
+// Send a plain text direct message to the contact matching the given public key prefix.
+// The node must be in contacts[] -- being in the recently-heard table is not enough, as a
+// contact can be evicted from contacts[] while its advert path lingers.
+// Returns one of the NODE_TXT_* codes.
+int MyMesh::sendTextToNode(const uint8_t* pubkey_prefix, int prefix_len, const char* text) {
+  ContactInfo* recipient = lookupContactByPubKey(pubkey_prefix, prefix_len);
+  if (recipient == NULL) return NODE_TXT_NO_CONTACT;
+
+  // use the node's own RTC (rather than a caller-supplied stamp) so that pressing twice in
+  // quick succession can't trip the recipient's replay protection
+  uint32_t expected_ack, est_timeout;
+  int result = sendMessage(*recipient, getRTCClock()->getCurrentTimeUnique(), 0, text,
+                           expected_ack, est_timeout);
+  if (result == MSG_SEND_FAILED) return NODE_TXT_SEND_FAILED;
+
+  if (expected_ack) {  // register, so the ACK gets matched and pushed up to the app
+    expected_ack_table[next_ack_idx].msg_sent = _ms->getMillis();
+    expected_ack_table[next_ack_idx].ack = expected_ack;
+    expected_ack_table[next_ack_idx].contact = recipient;
+    next_ack_idx = (next_ack_idx + 1) % EXPECTED_ACK_TABLE_SIZE;
+  }
+  return NODE_TXT_OK;
+}
+
 // To check if there is pending work
 bool MyMesh::hasPendingWork() const {
   return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0;
