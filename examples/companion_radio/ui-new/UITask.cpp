@@ -29,6 +29,15 @@
   #define PRESS_LABEL "long press"
 #endif
 
+// the PING page sends this text to the named GroupChannel (must already be configured
+// on this node, eg. added via the companion app)
+#ifndef UI_PING_CHANNEL_NAME
+  #define UI_PING_CHANNEL_NAME  "test"
+#endif
+#ifndef UI_PING_TEXT
+  #define UI_PING_TEXT  "Ping"
+#endif
+
 #include "icons.h"
 
 class SplashScreen : public UIScreen {
@@ -91,6 +100,7 @@ class HomeScreen : public UIScreen {
     RADIO,
     BLUETOOTH,
     ADVERT,
+    PING,
 #if ENV_INCLUDE_GPS == 1
     GPS,
 #endif
@@ -299,6 +309,11 @@ public:
       display.drawXbm((display.width() - 32) / 2, 18, advert_icon, 32, 32);
       display.setColor(UIColor::secondary_txt);
       display.drawTextCentered(display.width() / 2, 64 - 11, "advert: " PRESS_LABEL);
+    } else if (_page == HomePage::PING) {
+      display.setColor(UIColor::corp_blue);
+      display.drawXbm((display.width() - 32) / 2, 18, ping_icon, 32, 32);
+      display.setColor(UIColor::secondary_txt);
+      display.drawTextCentered(display.width() / 2, 64 - 11, "#" UI_PING_CHANNEL_NAME ": " PRESS_LABEL);
 #if ENV_INCLUDE_GPS == 1
     } else if (_page == HomePage::GPS) {
       LocationProvider* nmea = sensors.getLocationProvider();
@@ -462,6 +477,21 @@ public:
         _task->showAlert("Advert sent!", 1000);
       } else {
         _task->showAlert("Advert failed..", 1000);
+      }
+      return true;
+    }
+    if (c == KEY_ENTER && _page == HomePage::PING) {
+      _task->notify(UIEventType::ack);
+      switch (the_mesh.sendTextToChannel(UI_PING_CHANNEL_NAME, UI_PING_TEXT)) {
+        case MyMesh::CHANNEL_TXT_OK:
+          _task->showAlert(UI_PING_TEXT " sent!", 1000);
+          break;
+        case MyMesh::CHANNEL_TXT_NO_CHANNEL:
+          _task->showAlert("No #" UI_PING_CHANNEL_NAME " channel", 1500);
+          break;
+        default:
+          _task->showAlert(UI_PING_TEXT " failed..", 1000);
+          break;
       }
       return true;
     }

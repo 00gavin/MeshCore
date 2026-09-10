@@ -2261,6 +2261,29 @@ bool MyMesh::advert() {
   }
 }
 
+// Send a plain text message to the GroupChannel with the given name (as configured by the
+// companion app). Matching is case-insensitive, and a leading '#' on either name is ignored,
+// as apps display channels as "#name" and users often include it when naming one.
+// Returns one of the CHANNEL_TXT_* codes.
+int MyMesh::sendTextToChannel(const char* channel_name, const char* text) {
+  if (*channel_name == '#') channel_name++;
+
+  for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+    ChannelDetails channel;
+    if (!getChannel(i, channel)) break;
+
+    const char* name = channel.name;
+    if (*name == '#') name++;
+    if (name[0] == 0 || strcasecmp(name, channel_name) != 0) continue;  // empty slot, or no match
+
+    return sendGroupMessage(getRTCClock()->getCurrentTime(), channel.channel, _prefs.node_name,
+                            text, strlen(text))
+               ? CHANNEL_TXT_OK
+               : CHANNEL_TXT_SEND_FAILED;
+  }
+  return CHANNEL_TXT_NO_CHANNEL;
+}
+
 // To check if there is pending work
 bool MyMesh::hasPendingWork() const {
   return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0;

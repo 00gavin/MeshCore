@@ -98,6 +98,11 @@ public:
   void loop();
   void handleCmdFrame(size_t len);
   bool advert();
+
+  // result codes for sendTextToChannel()
+  enum { CHANNEL_TXT_OK = 0, CHANNEL_TXT_NO_CHANNEL = 1, CHANNEL_TXT_SEND_FAILED = 2 };
+  int sendTextToChannel(const char* channel_name, const char* text);
+
   void enterCLIRescue();
 
   int  getRecentlyHeard(AdvertPath dest[], int max_num);
