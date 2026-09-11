@@ -90,8 +90,10 @@ struct AdvertPath {
 #ifndef MSG_HISTORY_SIZE
   #define MSG_HISTORY_SIZE  32   // shared, so needs headroom above the 16 the UI shows
 #endif
+// Big enough for the longest message the radio can carry, so nothing is lost on the way into
+// the ring -- anything shorter would silently clip long messages rather than let them wrap.
 #ifndef MSG_HISTORY_TEXT_LEN
-  #define MSG_HISTORY_TEXT_LEN  100   // MAX_TEXT_LEN is 160; longer texts are truncated
+  #define MSG_HISTORY_TEXT_LEN  (MAX_TEXT_LEN + 1)
 #endif
 
 struct MsgHistoryEntry {

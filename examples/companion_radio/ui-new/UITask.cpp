@@ -57,11 +57,11 @@ static const char* const UI_SEND_MESSAGES[] = {
 #ifndef UI_READ_MSG_COUNT
   #define UI_READ_MSG_COUNT  16
 #endif
-#ifndef UI_READ_DEFAULT_CHANNEL
-  #define UI_READ_DEFAULT_CHANNEL  "Public"
-#endif
 #ifndef UI_READ_SCROLL_MILLIS
   #define UI_READ_SCROLL_MILLIS  2000   // advance the text one line this often
+#endif
+#ifndef UI_READ_TOP_MILLIS
+  #define UI_READ_TOP_MILLIS  5000   // but hold longer at the top, on the newest message
 #endif
 // The message view hides the title bar and uses the full height, so the row count comes from
 // the display rather than being fixed. 11px matches the line spacing used elsewhere.
@@ -178,10 +178,16 @@ class HomeScreen : public UIScreen {
   MsgHistoryEntry _read_msgs[UI_READ_MSG_COUNT];
   int  _read_num;
 
-  // back to the top, and hold there for a full interval before scrolling starts
+  // How long the current line stays put. The top of the list holds longer, so the newest
+  // message can be read without having to catch it mid-scroll.
+  unsigned long readHoldMillis() const {
+    return (_read_scroll == 0) ? UI_READ_TOP_MILLIS : UI_READ_SCROLL_MILLIS;
+  }
+
+  // back to the top, and hold there before scrolling starts
   void readRestart() {
     _read_scroll = 0;
-    _read_next_scroll = millis() + UI_READ_SCROLL_MILLIS;
+    _read_next_scroll = millis() + readHoldMillis();
   }
 
   int targetRows() const { return _num_targets; }
@@ -198,24 +204,22 @@ class HomeScreen : public UIScreen {
     return first;
   }
 
-  // Pick the default READ target. Deferred rather than done in the constructor, because the
-  // mesh loads its channels from flash after the UI is constructed.
+  // Default the READ target to the first subscribed channel. Deferred rather than done in the
+  // constructor, because the mesh loads its channels from flash after the UI is constructed.
   void readEnsureTarget() {
     if (_read_target.name[0] != 0) return;
 
     ChannelDetails ch;
-    int found = -1;
     for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
-      if (!the_mesh.getChannel(i, ch) || ch.name[0] == 0) continue;
-      if (found < 0) found = i;                                   // fall back to the first
-      if (strcmp(ch.name, UI_READ_DEFAULT_CHANNEL) == 0) { found = i; break; }
-    }
-    if (found < 0 || !the_mesh.getChannel(found, ch)) return;      // no channels configured
+      if (!the_mesh.getChannel(i, ch) || ch.name[0] == 0) continue;   // unused slot
 
-    memset(&_read_target, 0, sizeof(_read_target));
-    _read_target.is_channel = true;
-    _read_target.channel_idx = found;
-    StrHelper::strncpy(_read_target.name, ch.name, sizeof(_read_target.name));
+      memset(&_read_target, 0, sizeof(_read_target));
+      _read_target.is_channel = true;
+      _read_target.channel_idx = i;
+      StrHelper::strncpy(_read_target.name, ch.name, sizeof(_read_target.name));
+      return;
+    }
+    // no channels configured at all -- leave the target unset, the page shows "No messages"
   }
 
   void readFetch() {
@@ -673,12 +677,13 @@ public:
           if (max_scroll < 0) max_scroll = 0;   // it all fits: nothing to scroll
 
           // first render since boot: hold at the top for a full interval before scrolling
-          if (_read_next_scroll == 0) _read_next_scroll = millis() + UI_READ_SCROLL_MILLIS;
+          if (_read_next_scroll == 0) _read_next_scroll = millis() + readHoldMillis();
 
           _read_scrolling = (max_scroll > 0);
           if (_read_scrolling && millis() >= _read_next_scroll) {
             _read_scroll = (_read_scroll >= max_scroll) ? 0 : _read_scroll + 1;
-            _read_next_scroll = millis() + UI_READ_SCROLL_MILLIS;
+            // readHoldMillis() reads the new position, so wrapping back to the top holds long
+            _read_next_scroll = millis() + readHoldMillis();
           }
           if (_read_scroll > max_scroll) _read_scroll = 0;   // messages arrived/aged out
           readDrawLines(display, _read_scroll, rows);
