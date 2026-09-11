@@ -99,9 +99,9 @@ public:
   void handleCmdFrame(size_t len);
   bool advert();
 
-  // result codes for sendTextToChannel()
+  // result codes for sendTextToChannelIdx()
   enum { CHANNEL_TXT_OK = 0, CHANNEL_TXT_NO_CHANNEL = 1, CHANNEL_TXT_SEND_FAILED = 2 };
-  int sendTextToChannel(const char* channel_name, const char* text);
+  int sendTextToChannelIdx(uint8_t channel_idx, const char* text);
 
   // result codes for sendTextToNode()
   enum { NODE_TXT_OK = 0, NODE_TXT_NO_CONTACT = 1, NODE_TXT_SEND_FAILED = 2 };

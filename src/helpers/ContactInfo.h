@@ -5,6 +5,9 @@
 
 #define OUT_PATH_UNKNOWN   0xFF
 
+// ContactInfo::flags -- LSB is the 'favourite' bit, upper bits carry the contact prefs
+#define CONTACT_FLAG_FAVOURITE   0x01
+
 struct ContactInfo {
   mesh::Identity id;
   char name[32];

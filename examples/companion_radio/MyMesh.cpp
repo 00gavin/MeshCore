@@ -2261,27 +2261,18 @@ bool MyMesh::advert() {
   }
 }
 
-// Send a plain text message to the GroupChannel with the given name (as configured by the
-// companion app). Matching is case-insensitive, and a leading '#' on either name is ignored,
-// as apps display channels as "#name" and users often include it when naming one.
+// Send a plain text message to the GroupChannel in the given slot.
 // Returns one of the CHANNEL_TXT_* codes.
-int MyMesh::sendTextToChannel(const char* channel_name, const char* text) {
-  if (*channel_name == '#') channel_name++;
+int MyMesh::sendTextToChannelIdx(uint8_t channel_idx, const char* text) {
+  ChannelDetails channel;
+  if (!getChannel(channel_idx, channel) || channel.name[0] == 0) return CHANNEL_TXT_NO_CHANNEL;
 
-  for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
-    ChannelDetails channel;
-    if (!getChannel(i, channel)) break;
-
-    const char* name = channel.name;
-    if (*name == '#') name++;
-    if (name[0] == 0 || strcasecmp(name, channel_name) != 0) continue;  // empty slot, or no match
-
-    return sendGroupMessage(getRTCClock()->getCurrentTime(), channel.channel, _prefs.node_name,
-                            text, strlen(text))
-               ? CHANNEL_TXT_OK
-               : CHANNEL_TXT_SEND_FAILED;
-  }
-  return CHANNEL_TXT_NO_CHANNEL;
+  // getCurrentTimeUnique() (rather than getCurrentTime()) as the timestamp also seeds the
+  // packet hash -- sending the same text twice in one second would otherwise collide
+  return sendGroupMessage(getRTCClock()->getCurrentTimeUnique(), channel.channel,
+                          _prefs.node_name, text, strlen(text))
+             ? CHANNEL_TXT_OK
+             : CHANNEL_TXT_SEND_FAILED;
 }
 
 // Send a plain text direct message to the contact matching the given public key prefix.

@@ -29,28 +29,33 @@
   #define PRESS_LABEL "long press"
 #endif
 
-// the PING page sends this text to the named GroupChannel (must already be configured
-// on this node, eg. added via the companion app)
-#ifndef UI_PING_CHANNEL_NAME
-  #define UI_PING_CHANNEL_NAME  "test"
-#endif
-#ifndef UI_PING_TEXT
-  #define UI_PING_TEXT  "Ping"
-#endif
-
 // the YO page sends one of these as a direct message, to a node picked from the
 // recently-heard list
-static const char* const UI_YO_MESSAGES[] = { "YO", "Yes", "No", "OK", "Boom" };
+static const char* const UI_YO_MESSAGES[] = {
+  "Yo", "Ping", "Bye", "Yes", "No", "OK", "On my way", "Here", "HELP", "Hold position",
+  "All clear", "Check in", "ETA 5m", "ETA 15m", "Delayed", "Stopped", "Meet here",
+  "At waypoint", "Moving", "Regroup", "Found sign", "Target located", "Lost",
+};
 #define UI_YO_NUM_MESSAGES  ((int)(sizeof(UI_YO_MESSAGES) / sizeof(UI_YO_MESSAGES[0])))
 
 // label for the page itself
 #ifndef UI_YO_TEXT
   #define UI_YO_TEXT  "YO"
 #endif
+// Total picker capacity, and per-source caps. Each source gets its own budget so that a busy
+// mesh (or a long channel list) can't crowd the others out of the picker entirely.
 #ifndef UI_YO_LIST_SIZE
-  #define UI_YO_LIST_SIZE  8
+  #define UI_YO_LIST_SIZE  20
+#endif
+#ifndef UI_YO_CHANNEL_MAX
+  #define UI_YO_CHANNEL_MAX  6
+#endif
+#ifndef UI_YO_RECENT_MAX
+  #define UI_YO_RECENT_MAX  8
 #endif
 #define UI_YO_VISIBLE_ROWS  4   // rows that fit under the title bar
+#define UI_YO_BACK_ROW      0   // row 0 of both pickers backs out a stage
+#define UI_YO_BACK_LABEL    "< Back"
 
 #include "icons.h"
 
@@ -114,7 +119,6 @@ class HomeScreen : public UIScreen {
     RADIO,
     BLUETOOTH,
     ADVERT,
-    PING,
     YO,
 #if ENV_INCLUDE_GPS == 1
     GPS,
@@ -134,31 +138,54 @@ class HomeScreen : public UIScreen {
   bool _shutdown_init;
   AdvertPath recent[UI_RECENT_LIST_SIZE];
 
-  // YO page state: pick a node, then pick what to say to it
-  enum YoStage { YO_IDLE = 0, YO_PICK_NODE, YO_PICK_MSG };
+  // YO page state: pick a target, then pick what to say to it
+  enum YoStage { YO_IDLE = 0, YO_PICK_TARGET, YO_PICK_MSG };
+  struct YoTarget {
+    char    name[32];
+    uint8_t pubkey_prefix[7];   // contacts only
+    uint8_t channel_idx;        // channels only
+    bool    is_channel;
+  };
   uint8_t _yo_stage;
-  int _yo_num, _yo_sel;                // nodes in the snapshot, and which one is selected
-  int _yo_msg;                         // index into UI_YO_MESSAGES
-  AdvertPath _yo_nodes[UI_YO_LIST_SIZE];
+  int _yo_num;                         // targets in the snapshot
+  // Both pickers carry a "Back" row at row 0, so the selection is a row index: row 0 is Back,
+  // and row N addresses entry N-1 of the underlying list.
+  int _yo_sel;                         // row in the target picker
+  int _yo_msg;                         // row in the message picker
+  YoTarget _yo_targets[UI_YO_LIST_SIZE];
+  // scratch for getRecentlyHeard(). A member rather than a local: the Arduino loop task only
+  // gets a 4KB stack, and AdvertPath is ~108 bytes apiece.
+  AdvertPath _yo_recent[UI_YO_RECENT_MAX];
+
+  int yoTargetRows() const { return _yo_num + 1; }
+  int yoMsgRows() const { return UI_YO_NUM_MESSAGES + 1; }
 
   void sendYo() {
-    auto node = &_yo_nodes[_yo_sel];
-    const char* text = UI_YO_MESSAGES[_yo_msg];
-    char alert[52];
+    auto target = &_yo_targets[_yo_sel - 1];
+    const char* text = UI_YO_MESSAGES[_yo_msg - 1];
+    char alert[56];
+    bool sent, missing;
 
     _task->notify(UIEventType::ack);
-    switch (the_mesh.sendTextToNode(node->pubkey_prefix, sizeof(node->pubkey_prefix), text)) {
-      case MyMesh::NODE_TXT_OK:
-        snprintf(alert, sizeof(alert), "%s -> %s", text, node->name);
-        _task->showAlert(alert, 1500);
-        break;
-      case MyMesh::NODE_TXT_NO_CONTACT:
-        _task->showAlert("Not a contact", 1500);
-        break;
-      default:
-        snprintf(alert, sizeof(alert), "%s failed..", text);
-        _task->showAlert(alert, 1000);
-        break;
+    if (target->is_channel) {
+      int rc = the_mesh.sendTextToChannelIdx(target->channel_idx, text);
+      sent = (rc == MyMesh::CHANNEL_TXT_OK);
+      missing = (rc == MyMesh::CHANNEL_TXT_NO_CHANNEL);
+    } else {
+      int rc = the_mesh.sendTextToNode(target->pubkey_prefix, sizeof(target->pubkey_prefix), text);
+      sent = (rc == MyMesh::NODE_TXT_OK);
+      missing = (rc == MyMesh::NODE_TXT_NO_CONTACT);
+    }
+
+    if (sent) {
+      snprintf(alert, sizeof(alert), "%s -> %s", text, target->name);
+      _task->showAlert(alert, 1500);
+    } else if (missing) {
+      // the snapshot was taken a few presses ago, so the target can have gone away since
+      _task->showAlert(target->is_channel ? "Channel is gone" : "Not a contact", 1500);
+    } else {
+      snprintf(alert, sizeof(alert), "%s failed..", text);
+      _task->showAlert(alert, 1000);
     }
   }
 
@@ -170,18 +197,72 @@ class HomeScreen : public UIScreen {
     display.drawTextEllipsized(8, y, display.width() - 8, text);
   }
 
-  // Snapshot the recently-heard nodes. Taking a copy matters: getRecentlyHeard() re-sorts the
-  // live table on every call, so reading it again between "select" and "send" could shift the
-  // list under the user and fire YO at the wrong node.
-  void yoTakeSnapshot() {
-    int n = the_mesh.getRecentlyHeard(_yo_nodes, UI_YO_LIST_SIZE);
-    _yo_num = 0;
-    for (int i = 0; i < n; i++) {
-      if (_yo_nodes[i].name[0] == 0) continue;   // empty slot
-      if (i != _yo_num) _yo_nodes[_yo_num] = _yo_nodes[i];
-      _yo_num++;
+  bool yoAlreadyListed(const uint8_t* pub_key) const {
+    for (int i = 0; i < _yo_num; i++) {
+      if (_yo_targets[i].is_channel) continue;
+      if (memcmp(_yo_targets[i].pubkey_prefix, pub_key,
+                 sizeof(_yo_targets[i].pubkey_prefix)) == 0) return true;
     }
-    _yo_sel = 0;
+    return false;
+  }
+
+  YoTarget* yoNewTarget() {
+    auto dest = &_yo_targets[_yo_num++];
+    memset(dest, 0, sizeof(*dest));
+    return dest;
+  }
+
+  // every configured (subscribed) channel, at the top of the list
+  void yoAppendChannels() {
+    ChannelDetails ch;
+    int added = 0;
+    for (int i = 0; i < MAX_GROUP_CHANNELS && added < UI_YO_CHANNEL_MAX
+                    && _yo_num < UI_YO_LIST_SIZE; i++) {
+      if (!the_mesh.getChannel(i, ch) || ch.name[0] == 0) continue;   // unused slot
+
+      auto dest = yoNewTarget();
+      dest->is_channel = true;
+      dest->channel_idx = i;
+      StrHelper::strncpy(dest->name, ch.name, sizeof(dest->name));
+      added++;
+    }
+  }
+
+  void yoAppendRecent() {
+    int n = the_mesh.getRecentlyHeard(_yo_recent, UI_YO_RECENT_MAX);
+    for (int i = 0; i < n && _yo_num < UI_YO_LIST_SIZE; i++) {
+      if (_yo_recent[i].name[0] == 0) continue;   // empty slot
+
+      auto dest = yoNewTarget();
+      memcpy(dest->pubkey_prefix, _yo_recent[i].pubkey_prefix, sizeof(dest->pubkey_prefix));
+      StrHelper::strncpy(dest->name, _yo_recent[i].name, sizeof(dest->name));
+    }
+  }
+
+  // Favourites are worth being able to reach even when they haven't been heard from lately,
+  // so append any the recently-heard list didn't already cover.
+  void yoAppendFavourites() {
+    ContactInfo contact;
+    auto iter = the_mesh.startContactsIterator();
+    while (_yo_num < UI_YO_LIST_SIZE && iter.hasNext(&the_mesh, contact)) {
+      if ((contact.flags & CONTACT_FLAG_FAVOURITE) == 0) continue;
+      if (contact.name[0] == 0 || yoAlreadyListed(contact.id.pub_key)) continue;
+
+      auto dest = yoNewTarget();
+      memcpy(dest->pubkey_prefix, contact.id.pub_key, sizeof(dest->pubkey_prefix));
+      StrHelper::strncpy(dest->name, contact.name, sizeof(dest->name));
+    }
+  }
+
+  // Snapshot what can be YO'd: channels first, then recently heard, then favourites. Taking a
+  // copy matters: getRecentlyHeard() re-sorts the live table on every call, so reading it again
+  // between "select" and "send" could shift the list under the user and fire at the wrong one.
+  void yoTakeSnapshot() {
+    _yo_num = 0;
+    yoAppendChannels();
+    yoAppendRecent();
+    yoAppendFavourites();
+    _yo_sel = (_yo_num > 0) ? 1 : UI_YO_BACK_ROW;   // start on the first real target
   }
 
 
@@ -375,43 +456,42 @@ public:
       display.drawXbm((display.width() - 32) / 2, 18, advert_icon, 32, 32);
       display.setColor(UIColor::secondary_txt);
       display.drawTextCentered(display.width() / 2, 64 - 11, "advert: " PRESS_LABEL);
-    } else if (_page == HomePage::PING) {
-      display.setColor(UIColor::corp_blue);
-      display.drawXbm((display.width() - 32) / 2, 18, ping_icon, 32, 32);
-      display.setColor(UIColor::secondary_txt);
-      display.drawTextCentered(display.width() / 2, 64 - 11, "#" UI_PING_CHANNEL_NAME ": " PRESS_LABEL);
     } else if (_page == HomePage::YO) {
-      char filtered_name[sizeof(_yo_nodes[0].name)];
-      if (_yo_stage == YO_PICK_NODE) {
+      char label[sizeof(_yo_targets[0].name)];
+      if (_yo_stage == YO_PICK_TARGET) {
         // scroll the window so the selection is always the last visible row
         int first = _yo_sel - (UI_YO_VISIBLE_ROWS - 1);
         if (first < 0) first = 0;
 
         int y = 20;
-        for (int i = first; i < _yo_num && i < first + UI_YO_VISIBLE_ROWS; i++, y += 11) {
-          display.translateUTF8ToBlocks(filtered_name, _yo_nodes[i].name, sizeof(filtered_name));
-          drawPickerRow(display, y, i == _yo_sel, filtered_name);
+        for (int i = first; i < yoTargetRows() && i < first + UI_YO_VISIBLE_ROWS; i++, y += 11) {
+          if (i == UI_YO_BACK_ROW) {
+            drawPickerRow(display, y, i == _yo_sel, UI_YO_BACK_LABEL);
+          } else {
+            display.translateUTF8ToBlocks(label, _yo_targets[i - 1].name, sizeof(label));
+            drawPickerRow(display, y, i == _yo_sel, label);
+          }
         }
       } else if (_yo_stage == YO_PICK_MSG) {
         // header: who this is going to, so the target is still visible while choosing
         display.setColor(UIColor::primary_txt);
         display.setCursor(0, 20);
         display.print("->");
-        display.translateUTF8ToBlocks(filtered_name, _yo_nodes[_yo_sel].name,
-                                      sizeof(filtered_name));
-        display.drawTextEllipsized(16, 20, display.width() - 16, filtered_name);
+        display.translateUTF8ToBlocks(label, _yo_targets[_yo_sel - 1].name, sizeof(label));
+        display.drawTextEllipsized(16, 20, display.width() - 16, label);
 
         const int rows = UI_YO_VISIBLE_ROWS - 1;   // header takes one row
         int first = _yo_msg - (rows - 1);
         if (first < 0) first = 0;
 
         int y = 31;
-        for (int i = first; i < UI_YO_NUM_MESSAGES && i < first + rows; i++, y += 11) {
-          drawPickerRow(display, y, i == _yo_msg, UI_YO_MESSAGES[i]);
+        for (int i = first; i < yoMsgRows() && i < first + rows; i++, y += 11) {
+          drawPickerRow(display, y, i == _yo_msg,
+                        i == UI_YO_BACK_ROW ? UI_YO_BACK_LABEL : UI_YO_MESSAGES[i - 1]);
         }
       } else {
         display.setColor(UIColor::corp_blue);
-        display.drawXbm((display.width() - 32) / 2, 18, rocket_icon, 32, 32);
+        display.drawXbm((display.width() - 32) / 2, 18, chat_icon, 32, 32);
         display.setColor(UIColor::secondary_txt);
         display.drawTextCentered(display.width() / 2, 64 - 11, UI_YO_TEXT ": " PRESS_LABEL);
       }
@@ -555,25 +635,29 @@ public:
   bool handleInput(char c) override {
     // the YO pickers are modal -- they swallow every key, so that a short press steps through
     // the list instead of paging the carousel
-    if (_yo_stage == YO_PICK_NODE) {
-      if (c == KEY_NEXT || c == KEY_RIGHT) {   // short press -> next node
-        _yo_sel = (_yo_sel + 1) % _yo_num;
-      } else if (c == KEY_PREV || c == KEY_LEFT) {   // double-click -> back out
-        _yo_stage = YO_IDLE;
-      } else if (c == KEY_ENTER) {   // long press -> now choose what to say
-        _yo_msg = 0;
-        _yo_stage = YO_PICK_MSG;
+    if (_yo_stage == YO_PICK_TARGET) {
+      if (c == KEY_NEXT || c == KEY_RIGHT) {   // short press -> next row
+        _yo_sel = (_yo_sel + 1) % yoTargetRows();
+      } else if (c == KEY_ENTER) {   // long press -> activate the selected row
+        if (_yo_sel == UI_YO_BACK_ROW) {
+          _yo_stage = YO_IDLE;
+        } else {
+          _yo_msg = 1;   // start on the first message, not on Back
+          _yo_stage = YO_PICK_MSG;
+        }
       }
       return true;
     }
     if (_yo_stage == YO_PICK_MSG) {
-      if (c == KEY_NEXT || c == KEY_RIGHT) {   // short press -> next message
-        _yo_msg = (_yo_msg + 1) % UI_YO_NUM_MESSAGES;
-      } else if (c == KEY_PREV || c == KEY_LEFT) {   // double-click -> back to the node list
-        _yo_stage = YO_PICK_NODE;
-      } else if (c == KEY_ENTER) {   // long press -> send
-        sendYo();
-        _yo_stage = YO_IDLE;
+      if (c == KEY_NEXT || c == KEY_RIGHT) {   // short press -> next row
+        _yo_msg = (_yo_msg + 1) % yoMsgRows();
+      } else if (c == KEY_ENTER) {   // long press -> activate the selected row
+        if (_yo_msg == UI_YO_BACK_ROW) {
+          _yo_stage = YO_PICK_TARGET;
+        } else {
+          sendYo();
+          _yo_stage = YO_IDLE;
+        }
       }
       return true;
     }
@@ -605,27 +689,12 @@ public:
       }
       return true;
     }
-    if (c == KEY_ENTER && _page == HomePage::PING) {
-      _task->notify(UIEventType::ack);
-      switch (the_mesh.sendTextToChannel(UI_PING_CHANNEL_NAME, UI_PING_TEXT)) {
-        case MyMesh::CHANNEL_TXT_OK:
-          _task->showAlert(UI_PING_TEXT " sent!", 1000);
-          break;
-        case MyMesh::CHANNEL_TXT_NO_CHANNEL:
-          _task->showAlert("No #" UI_PING_CHANNEL_NAME " channel", 1500);
-          break;
-        default:
-          _task->showAlert(UI_PING_TEXT " failed..", 1000);
-          break;
-      }
-      return true;
-    }
-    if (c == KEY_ENTER && _page == HomePage::YO) {   // long press -> open the node picker
+    if (c == KEY_ENTER && _page == HomePage::YO) {   // long press -> open the target picker
       yoTakeSnapshot();
       if (_yo_num == 0) {
-        _task->showAlert("No recent nodes", 1200);
+        _task->showAlert("Nothing to send to", 1200);
       } else {
-        _yo_stage = YO_PICK_NODE;
+        _yo_stage = YO_PICK_TARGET;
       }
       return true;
     }
