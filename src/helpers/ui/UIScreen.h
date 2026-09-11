@@ -21,5 +21,9 @@ public:
   virtual int render(DisplayDriver& display) =0;   // return value is number of millis until next render
   virtual bool handleInput(char c) { return false; }
   virtual void poll() { }
+  // True while the screen wants every button release reported as a separate click, with no
+  // multi-click detection. Use for long lists, where clicking quickly to scan through would
+  // otherwise be swallowed into double-clicks.
+  virtual bool wantsFastClicks() const { return false; }
 };
 

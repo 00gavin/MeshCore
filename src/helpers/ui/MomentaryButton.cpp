@@ -43,6 +43,18 @@ bool  MomentaryButton::isPressed() const {
   return isPressed(btn);
 }
 
+void MomentaryButton::setMultiClick(bool enabled) {
+  int window = enabled ? MULTI_CLICK_WINDOW_MS : 0;
+  if (window == _multi_click_window) return;
+
+  _multi_click_window = window;
+  if (!enabled) {   // drop any part-formed multi-click, so it can't fire after the switch
+    _click_count = 0;
+    _last_click_time = 0;
+    _pending_click = false;
+  }
+}
+
 void MomentaryButton::cancelClick() {
   cancel = 1;
   down_at = 0;

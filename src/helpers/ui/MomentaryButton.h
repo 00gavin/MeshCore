@@ -28,6 +28,10 @@ public:
   void begin();
   int check(bool repeat_click=false);  // returns one of BUTTON_EVENT_*
   void cancelClick();  // suppress next BUTTON_EVENT_CLICK (if already in DOWN state)
+  // Turn multi-click detection on/off at runtime. While off, each release reports a CLICK
+  // immediately instead of being held back to see whether a second click follows -- which
+  // makes repeated clicking both faster and free of accidental DOUBLE/TRIPLE_CLICKs.
+  void setMultiClick(bool enabled);
   uint8_t getPin() { return _pin; }
   bool isPressed() const;
 };

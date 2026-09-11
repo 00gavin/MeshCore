@@ -29,33 +29,44 @@
   #define PRESS_LABEL "long press"
 #endif
 
-// the YO page sends one of these as a direct message, to a node picked from the
-// recently-heard list
-static const char* const UI_YO_MESSAGES[] = {
+// the READ page can send one of these to whichever channel/contact is being viewed
+static const char* const UI_SEND_MESSAGES[] = {
   "Yo", "Ping", "Bye", "Yes", "No", "OK", "On my way", "Here", "HELP", "Hold position",
   "All clear", "Check in", "ETA 5m", "ETA 15m", "Delayed", "Stopped", "Meet here",
   "At waypoint", "Moving", "Regroup", "Found sign", "Target located", "Lost",
 };
-#define UI_YO_NUM_MESSAGES  ((int)(sizeof(UI_YO_MESSAGES) / sizeof(UI_YO_MESSAGES[0])))
+#define UI_SEND_NUM_MESSAGES  ((int)(sizeof(UI_SEND_MESSAGES) / sizeof(UI_SEND_MESSAGES[0])))
 
-// label for the page itself
-#ifndef UI_YO_TEXT
-  #define UI_YO_TEXT  "YO"
-#endif
 // Total picker capacity, and per-source caps. Each source gets its own budget so that a busy
 // mesh (or a long channel list) can't crowd the others out of the picker entirely.
-#ifndef UI_YO_LIST_SIZE
-  #define UI_YO_LIST_SIZE  20
+#ifndef UI_TARGET_LIST_SIZE
+  #define UI_TARGET_LIST_SIZE  20
 #endif
-#ifndef UI_YO_CHANNEL_MAX
-  #define UI_YO_CHANNEL_MAX  6
+#ifndef UI_TARGET_CHANNEL_MAX
+  #define UI_TARGET_CHANNEL_MAX  6
 #endif
-#ifndef UI_YO_RECENT_MAX
-  #define UI_YO_RECENT_MAX  8
+#ifndef UI_TARGET_RECENT_MAX
+  #define UI_TARGET_RECENT_MAX  8
 #endif
-#define UI_YO_VISIBLE_ROWS  4   // rows that fit under the title bar
-#define UI_YO_BACK_ROW      0   // row 0 of both pickers backs out a stage
-#define UI_YO_BACK_LABEL    "< Back"
+#define UI_PICK_VISIBLE_ROWS  4   // rows that fit under the title bar
+#ifndef UI_PICK_TIMEOUT_MILLIS
+  #define UI_PICK_TIMEOUT_MILLIS  8000   // close an idle picker without acting on it
+#endif
+
+// the READ page shows recent messages for one channel or contact
+#ifndef UI_READ_MSG_COUNT
+  #define UI_READ_MSG_COUNT  16
+#endif
+#ifndef UI_READ_DEFAULT_CHANNEL
+  #define UI_READ_DEFAULT_CHANNEL  "Public"
+#endif
+#ifndef UI_READ_SCROLL_MILLIS
+  #define UI_READ_SCROLL_MILLIS  2000   // advance the text one line this often
+#endif
+// The message view hides the title bar and uses the full height, so the row count comes from
+// the display rather than being fixed. 11px matches the line spacing used elsewhere.
+#define UI_READ_LINE_HEIGHT  11
+#define UI_READ_SCROLLBAR_W  2   // scrollbar down the right edge of the message view
 
 #include "icons.h"
 
@@ -114,12 +125,12 @@ public:
 
 class HomeScreen : public UIScreen {
   enum HomePage {
-    FIRST,
+    READ,      // first, so the device wakes up showing messages
+    STATUS,
     RECENT,
     RADIO,
     BLUETOOTH,
     ADVERT,
-    YO,
 #if ENV_INCLUDE_GPS == 1
     GPS,
 #endif
@@ -138,31 +149,183 @@ class HomeScreen : public UIScreen {
   bool _shutdown_init;
   AdvertPath recent[UI_RECENT_LIST_SIZE];
 
-  // YO page state: pick a target, then pick what to say to it
-  enum YoStage { YO_IDLE = 0, YO_PICK_TARGET, YO_PICK_MSG };
-  struct YoTarget {
+  struct PickTarget {
     char    name[32];
     uint8_t pubkey_prefix[7];   // contacts only
     uint8_t channel_idx;        // channels only
     bool    is_channel;
   };
-  uint8_t _yo_stage;
-  int _yo_num;                         // targets in the snapshot
-  // Both pickers carry a "Back" row at row 0, so the selection is a row index: row 0 is Back,
-  // and row N addresses entry N-1 of the underlying list.
-  int _yo_sel;                         // row in the target picker
-  int _yo_msg;                         // row in the message picker
-  YoTarget _yo_targets[UI_YO_LIST_SIZE];
+  int _num_targets;                    // targets in the snapshot
+  PickTarget _targets[UI_TARGET_LIST_SIZE];
   // scratch for getRecentlyHeard(). A member rather than a local: the Arduino loop task only
   // gets a 4KB stack, and AdvertPath is ~108 bytes apiece.
-  AdvertPath _yo_recent[UI_YO_RECENT_MAX];
+  AdvertPath _recent_scratch[UI_TARGET_RECENT_MAX];
 
-  int yoTargetRows() const { return _yo_num + 1; }
-  int yoMsgRows() const { return UI_YO_NUM_MESSAGES + 1; }
+  // READ page state: view the conversation, or pick a target to read, or pick a message to
+  // send to it. Neither picker has a "Back" row, so a selection indexes its list directly.
+  // The pickers run with multi-click detection off (see wantsFastClicks), so on single-button
+  // hardware the way out without acting is to let the picker time out; boards with a separate
+  // left/back button can still use that, as it is not subject to click coalescing.
+  enum ReadStage { READ_VIEW = 0, READ_PICK_TARGET, READ_PICK_MSG };
+  uint8_t _read_stage;
+  int  _read_sel;                      // index into _targets
+  int  _read_msg_sel;                  // index into UI_SEND_MESSAGES
+  unsigned long _read_pick_expiry;     // when an idle picker gives up and closes
+  int  _read_scroll;                   // index of the first visible wrapped line
+  unsigned long _read_next_scroll;     // when the text next advances a line
+  bool _read_scrolling;                // there is more text than fits, so keep re-rendering
+  PickTarget _read_target;             // what is being read (lazily defaulted to Public)
+  MsgHistoryEntry _read_msgs[UI_READ_MSG_COUNT];
+  int  _read_num;
 
-  void sendYo() {
-    auto target = &_yo_targets[_yo_sel - 1];
-    const char* text = UI_YO_MESSAGES[_yo_msg - 1];
+  // back to the top, and hold there for a full interval before scrolling starts
+  void readRestart() {
+    _read_scroll = 0;
+    _read_next_scroll = millis() + UI_READ_SCROLL_MILLIS;
+  }
+
+  int targetRows() const { return _num_targets; }
+  int sendMsgRows() const { return UI_SEND_NUM_MESSAGES; }
+
+  // First row to draw in a picker window. The selection is kept one row up from the bottom
+  // where there is room, so the entry coming next is already on screen, and the window never
+  // runs past the end of the list into blank rows.
+  int pickerWindowStart(int sel, int total, int rows) const {
+    int lookahead = (rows > 2) ? 1 : 0;
+    int first = sel - (rows - 1 - lookahead);
+    if (first > total - rows) first = total - rows;
+    if (first < 0) first = 0;
+    return first;
+  }
+
+  // Pick the default READ target. Deferred rather than done in the constructor, because the
+  // mesh loads its channels from flash after the UI is constructed.
+  void readEnsureTarget() {
+    if (_read_target.name[0] != 0) return;
+
+    ChannelDetails ch;
+    int found = -1;
+    for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+      if (!the_mesh.getChannel(i, ch) || ch.name[0] == 0) continue;
+      if (found < 0) found = i;                                   // fall back to the first
+      if (strcmp(ch.name, UI_READ_DEFAULT_CHANNEL) == 0) { found = i; break; }
+    }
+    if (found < 0 || !the_mesh.getChannel(found, ch)) return;      // no channels configured
+
+    memset(&_read_target, 0, sizeof(_read_target));
+    _read_target.is_channel = true;
+    _read_target.channel_idx = found;
+    StrHelper::strncpy(_read_target.name, ch.name, sizeof(_read_target.name));
+  }
+
+  void readFetch() {
+    readEnsureTarget();
+    if (_read_target.name[0] == 0) {
+      _read_num = 0;
+    } else if (_read_target.is_channel) {
+      _read_num = the_mesh.getChannelHistory(_read_target.channel_idx, _read_msgs,
+                                             UI_READ_MSG_COUNT);
+    } else {
+      _read_num = the_mesh.getContactHistory(_read_target.pubkey_prefix,
+                                             sizeof(_read_target.pubkey_prefix),
+                                             _read_msgs, UI_READ_MSG_COUNT);
+    }
+  }
+
+  // Length of the longest prefix of str that fits in max_width, broken at a space where one is
+  // available so words are not split. Always returns >= 1 so the caller cannot loop forever.
+  int readWrapPoint(DisplayDriver& display, const char* str, int max_width) {
+    char tmp[64];
+    int fits = 0, last_space = 0;
+    for (int n = 1; n < (int)sizeof(tmp) && str[n - 1] != 0; n++) {
+      memcpy(tmp, str, n);
+      tmp[n] = 0;
+      if ((int)display.getTextWidth(tmp) > max_width) break;
+      fits = n;
+      if (str[n - 1] == ' ') last_space = n;
+    }
+    if (str[fits] != 0 && last_space > 0) return last_space;   // would split a word
+    return fits > 0 ? fits : 1;
+  }
+
+  // How many text rows fit, given that the message view gets the whole display. Rounded up:
+  // glyphs are a good deal shorter than the 11px line spacing (6px on most of these panels),
+  // so the bottom row still renders in full even though 64 isn't a multiple of the spacing.
+  int readVisibleRows(DisplayDriver& display) const {
+    int rows = (display.height() + UI_READ_LINE_HEIGHT - 1) / UI_READ_LINE_HEIGHT;
+    return (rows > 0) ? rows : 1;
+  }
+
+  // Width available to text. The scrollbar gutter is reserved whether or not the bar is
+  // actually drawn, so that the wrapped line count doesn't change as it appears/disappears.
+  int readTextWidth(DisplayDriver& display) const {
+    return display.width() - UI_READ_SCROLLBAR_W - 1;
+  }
+
+  // Thin scrollbar down the right edge. Only the thumb is drawn: its length is the fraction of
+  // the conversation on screen, its position is how far down that window sits. Deliberately no
+  // background track -- every display driver here defines primary_txt and secondary_txt as the
+  // same colour, so a track would merge with the thumb into one featureless bar.
+  void readDrawScrollbar(DisplayDriver& display, int scroll, int total, int rows) {
+    int h = display.height();
+    int x = display.width() - UI_READ_SCROLLBAR_W;
+
+    int thumb = (h * rows) / total;
+    if (thumb < 3) thumb = 3;          // keep it visible on very long conversations
+    if (thumb > h) thumb = h;
+
+    int max_scroll = total - rows;
+    int y = (max_scroll > 0) ? ((h - thumb) * scroll) / max_scroll : 0;
+
+    display.setColor(UIColor::primary_txt);
+    display.fillRect(x, y, UI_READ_SCROLLBAR_W, thumb);
+  }
+
+  // Draw the wrapped message lines falling inside [first, first + rows), and return the total
+  // line count. Pass rows = 0 to count without drawing.
+  int readDrawLines(DisplayDriver& display, int first, int rows) {
+    char composed[sizeof(_read_msgs[0].sender) + sizeof(_read_msgs[0].text) + 4];
+    char shown[sizeof(composed)];
+    int line = 0;
+    int y = 0;   // no title bar on this page, so start at the very top
+
+    for (int m = 0; m < _read_num; m++) {
+      auto msg = &_read_msgs[m];
+      // channel payloads already lead with "<sender>: "; DMs need the contact name prepended
+      if (msg->sender[0] != 0) {
+        snprintf(composed, sizeof(composed), "%s: %s", msg->sender, msg->text);
+      } else {
+        StrHelper::strncpy(composed, msg->text, sizeof(composed));
+      }
+      display.translateUTF8ToBlocks(shown, composed, sizeof(shown));
+
+      bool is_first_line = true;
+      for (const char* p = shown; *p; ) {
+        int n = readWrapPoint(display, p, readTextWidth(display));
+        if (line >= first && line < first + rows) {
+          char row[64];
+          int len = (n < (int)sizeof(row) - 1) ? n : (int)sizeof(row) - 1;
+          memcpy(row, p, len);
+          row[len] = 0;
+          // dim the continuation lines, so where each message starts stays readable
+          display.setColor(is_first_line ? UIColor::primary_txt : UIColor::secondary_txt);
+          display.setCursor(0, y);
+          display.print(row);
+          y += UI_READ_LINE_HEIGHT;
+        }
+        line++;
+        is_first_line = false;
+        p += n;
+        while (*p == ' ') p++;   // don't start the next line on the break space
+      }
+    }
+    return line;
+  }
+
+  // send the picked message to whichever conversation is currently being read
+  void sendPickedMessage() {
+    auto target = &_read_target;
+    const char* text = UI_SEND_MESSAGES[_read_msg_sel];
     char alert[56];
     bool sent, missing;
 
@@ -181,7 +344,7 @@ class HomeScreen : public UIScreen {
       snprintf(alert, sizeof(alert), "%s -> %s", text, target->name);
       _task->showAlert(alert, 1500);
     } else if (missing) {
-      // the snapshot was taken a few presses ago, so the target can have gone away since
+      // the target was picked some time ago, so it can have gone away since
       _task->showAlert(target->is_channel ? "Channel is gone" : "Not a contact", 1500);
     } else {
       snprintf(alert, sizeof(alert), "%s failed..", text);
@@ -197,30 +360,30 @@ class HomeScreen : public UIScreen {
     display.drawTextEllipsized(8, y, display.width() - 8, text);
   }
 
-  bool yoAlreadyListed(const uint8_t* pub_key) const {
-    for (int i = 0; i < _yo_num; i++) {
-      if (_yo_targets[i].is_channel) continue;
-      if (memcmp(_yo_targets[i].pubkey_prefix, pub_key,
-                 sizeof(_yo_targets[i].pubkey_prefix)) == 0) return true;
+  bool targetAlreadyListed(const uint8_t* pub_key) const {
+    for (int i = 0; i < _num_targets; i++) {
+      if (_targets[i].is_channel) continue;
+      if (memcmp(_targets[i].pubkey_prefix, pub_key,
+                 sizeof(_targets[i].pubkey_prefix)) == 0) return true;
     }
     return false;
   }
 
-  YoTarget* yoNewTarget() {
-    auto dest = &_yo_targets[_yo_num++];
+  PickTarget* newTarget() {
+    auto dest = &_targets[_num_targets++];
     memset(dest, 0, sizeof(*dest));
     return dest;
   }
 
   // every configured (subscribed) channel, at the top of the list
-  void yoAppendChannels() {
+  void appendChannelTargets() {
     ChannelDetails ch;
     int added = 0;
-    for (int i = 0; i < MAX_GROUP_CHANNELS && added < UI_YO_CHANNEL_MAX
-                    && _yo_num < UI_YO_LIST_SIZE; i++) {
+    for (int i = 0; i < MAX_GROUP_CHANNELS && added < UI_TARGET_CHANNEL_MAX
+                    && _num_targets < UI_TARGET_LIST_SIZE; i++) {
       if (!the_mesh.getChannel(i, ch) || ch.name[0] == 0) continue;   // unused slot
 
-      auto dest = yoNewTarget();
+      auto dest = newTarget();
       dest->is_channel = true;
       dest->channel_idx = i;
       StrHelper::strncpy(dest->name, ch.name, sizeof(dest->name));
@@ -228,41 +391,41 @@ class HomeScreen : public UIScreen {
     }
   }
 
-  void yoAppendRecent() {
-    int n = the_mesh.getRecentlyHeard(_yo_recent, UI_YO_RECENT_MAX);
-    for (int i = 0; i < n && _yo_num < UI_YO_LIST_SIZE; i++) {
-      if (_yo_recent[i].name[0] == 0) continue;   // empty slot
+  void appendRecentTargets() {
+    int n = the_mesh.getRecentlyHeard(_recent_scratch, UI_TARGET_RECENT_MAX);
+    for (int i = 0; i < n && _num_targets < UI_TARGET_LIST_SIZE; i++) {
+      if (_recent_scratch[i].name[0] == 0) continue;   // empty slot
 
-      auto dest = yoNewTarget();
-      memcpy(dest->pubkey_prefix, _yo_recent[i].pubkey_prefix, sizeof(dest->pubkey_prefix));
-      StrHelper::strncpy(dest->name, _yo_recent[i].name, sizeof(dest->name));
+      auto dest = newTarget();
+      memcpy(dest->pubkey_prefix, _recent_scratch[i].pubkey_prefix, sizeof(dest->pubkey_prefix));
+      StrHelper::strncpy(dest->name, _recent_scratch[i].name, sizeof(dest->name));
     }
   }
 
   // Favourites are worth being able to reach even when they haven't been heard from lately,
   // so append any the recently-heard list didn't already cover.
-  void yoAppendFavourites() {
+  void appendFavouriteTargets() {
     ContactInfo contact;
     auto iter = the_mesh.startContactsIterator();
-    while (_yo_num < UI_YO_LIST_SIZE && iter.hasNext(&the_mesh, contact)) {
+    while (_num_targets < UI_TARGET_LIST_SIZE && iter.hasNext(&the_mesh, contact)) {
       if ((contact.flags & CONTACT_FLAG_FAVOURITE) == 0) continue;
-      if (contact.name[0] == 0 || yoAlreadyListed(contact.id.pub_key)) continue;
+      if (contact.name[0] == 0 || targetAlreadyListed(contact.id.pub_key)) continue;
 
-      auto dest = yoNewTarget();
+      auto dest = newTarget();
       memcpy(dest->pubkey_prefix, contact.id.pub_key, sizeof(dest->pubkey_prefix));
       StrHelper::strncpy(dest->name, contact.name, sizeof(dest->name));
     }
   }
 
-  // Snapshot what can be YO'd: channels first, then recently heard, then favourites. Taking a
-  // copy matters: getRecentlyHeard() re-sorts the live table on every call, so reading it again
-  // between "select" and "send" could shift the list under the user and fire at the wrong one.
-  void yoTakeSnapshot() {
-    _yo_num = 0;
-    yoAppendChannels();
-    yoAppendRecent();
-    yoAppendFavourites();
-    _yo_sel = (_yo_num > 0) ? 1 : UI_YO_BACK_ROW;   // start on the first real target
+  // Snapshot what can be picked: channels first, then recently heard, then favourites. Shared
+  // by the YO and READ pickers. Taking a copy matters: getRecentlyHeard() re-sorts the live
+  // table on every call, so reading it again between "select" and "use" could shift the list
+  // under the user and act on the wrong one.
+  void takeTargetSnapshot() {
+    _num_targets = 0;
+    appendChannelTargets();
+    appendRecentTargets();
+    appendFavouriteTargets();
   }
 
 
@@ -336,47 +499,68 @@ class HomeScreen : public UIScreen {
 public:
   HomeScreen(UITask* task, mesh::RTCClock* rtc, SensorManager* sensors, NodePrefs* node_prefs)
      : _task(task), _rtc(rtc), _sensors(sensors), _node_prefs(node_prefs), _page(0),
-       _shutdown_init(false), _yo_stage(YO_IDLE), _yo_num(0), _yo_sel(0), _yo_msg(0),
-       sensors_lpp(200) {  }
+       _shutdown_init(false), _num_targets(0), _read_stage(READ_VIEW), _read_sel(0),
+       _read_msg_sel(0), _read_pick_expiry(0), _read_scroll(0), _read_next_scroll(0),
+       _read_scrolling(false), _read_num(0), sensors_lpp(200) {
+    memset(&_read_target, 0, sizeof(_read_target));
+  }
 
   void poll() override {
     if (_shutdown_init && !_task->isButtonPressed()) {  // must wait for USR button to be released
       _task->shutdown();
     }
+    // With multi-click off there is no back gesture inside the pickers, and long-press in the
+    // message picker sends -- so idling out is the way to leave without acting.
+    if (_read_stage != READ_VIEW && millis() >= _read_pick_expiry) {
+      _read_stage = READ_VIEW;
+    }
+  }
+
+  // the pickers are long lists, and are stepped through with repeated clicks
+  bool wantsFastClicks() const override {
+    return _page == HomePage::READ && _read_stage != READ_VIEW;
   }
 
   int render(DisplayDriver& display) override {
-    display.setColor(UIColor::title_bkg);
-    display.fillRect(0, 0, display.width(), 12);
     char tmp[80];
-    // node name
-    display.setTextSize(1);
-    display.setColor(UIColor::title_txt);
-    char filtered_name[sizeof(_node_prefs->node_name)];
-    display.translateUTF8ToBlocks(filtered_name, _node_prefs->node_name, sizeof(filtered_name));
-    display.setCursor(0, 2);
-    display.print(filtered_name);
+    // The message view gets the whole display: the node name and battery are on every other
+    // page, so repeating them here would only cost rows of text.
+    bool show_title_bar = !(_page == HomePage::READ && _read_stage == READ_VIEW);
 
-    // battery voltage
-    renderBatteryIndicator(display, _task->getBattMilliVolts());
-
-    // curr page indicator
-    if (UIColor::title_bkg == UIColor::window_bkg) {
-      display.setColor(UIColor::title_txt);
-    } else {
+    if (show_title_bar) {
       display.setColor(UIColor::title_bkg);
-    }
-    int y = 14;
-    int x = display.width() / 2 - 5 * (HomePage::Count-1);
-    for (uint8_t i = 0; i < HomePage::Count; i++, x += 10) {
-      if (i == _page) {
-        display.fillRect(x-1, y-1, 4, 4);
+      display.fillRect(0, 0, display.width(), 12);
+
+      // node name
+      display.setTextSize(1);
+      display.setColor(UIColor::title_txt);
+      char filtered_name[sizeof(_node_prefs->node_name)];
+      display.translateUTF8ToBlocks(filtered_name, _node_prefs->node_name,
+                                    sizeof(filtered_name));
+      display.setCursor(0, 2);
+      display.print(filtered_name);
+
+      // battery voltage
+      renderBatteryIndicator(display, _task->getBattMilliVolts());
+
+      // curr page indicator
+      if (UIColor::title_bkg == UIColor::window_bkg) {
+        display.setColor(UIColor::title_txt);
       } else {
-        display.fillRect(x, y, 2, 2);
+        display.setColor(UIColor::title_bkg);
+      }
+      int y = 14;
+      int x = display.width() / 2 - 5 * (HomePage::Count-1);
+      for (uint8_t i = 0; i < HomePage::Count; i++, x += 10) {
+        if (i == _page) {
+          display.fillRect(x-1, y-1, 4, 4);
+        } else {
+          display.fillRect(x, y, 2, 2);
+        }
       }
     }
 
-    if (_page == HomePage::FIRST) {
+    if (_page == HomePage::STATUS) {
       display.setColor(UIColor::primary_txt);
       display.setTextSize(2);
       sprintf(tmp, "MSG: %d", _task->getMsgCount());
@@ -456,44 +640,50 @@ public:
       display.drawXbm((display.width() - 32) / 2, 18, advert_icon, 32, 32);
       display.setColor(UIColor::secondary_txt);
       display.drawTextCentered(display.width() / 2, 64 - 11, "advert: " PRESS_LABEL);
-    } else if (_page == HomePage::YO) {
-      char label[sizeof(_yo_targets[0].name)];
-      if (_yo_stage == YO_PICK_TARGET) {
-        // scroll the window so the selection is always the last visible row
-        int first = _yo_sel - (UI_YO_VISIBLE_ROWS - 1);
-        if (first < 0) first = 0;
+    } else if (_page == HomePage::READ) {
+      _read_scrolling = false;
+      char label[sizeof(_targets[0].name)];
+      if (_read_stage == READ_PICK_TARGET) {
+        int first = pickerWindowStart(_read_sel, targetRows(), UI_PICK_VISIBLE_ROWS);
 
         int y = 20;
-        for (int i = first; i < yoTargetRows() && i < first + UI_YO_VISIBLE_ROWS; i++, y += 11) {
-          if (i == UI_YO_BACK_ROW) {
-            drawPickerRow(display, y, i == _yo_sel, UI_YO_BACK_LABEL);
-          } else {
-            display.translateUTF8ToBlocks(label, _yo_targets[i - 1].name, sizeof(label));
-            drawPickerRow(display, y, i == _yo_sel, label);
-          }
+        for (int i = first; i < targetRows() && i < first + UI_PICK_VISIBLE_ROWS; i++, y += 11) {
+          display.translateUTF8ToBlocks(label, _targets[i].name, sizeof(label));
+          drawPickerRow(display, y, i == _read_sel, label);
         }
-      } else if (_yo_stage == YO_PICK_MSG) {
-        // header: who this is going to, so the target is still visible while choosing
-        display.setColor(UIColor::primary_txt);
-        display.setCursor(0, 20);
-        display.print("->");
-        display.translateUTF8ToBlocks(label, _yo_targets[_yo_sel - 1].name, sizeof(label));
-        display.drawTextEllipsized(16, 20, display.width() - 16, label);
+      } else if (_read_stage == READ_PICK_MSG) {
+        int first = pickerWindowStart(_read_msg_sel, sendMsgRows(), UI_PICK_VISIBLE_ROWS);
 
-        const int rows = UI_YO_VISIBLE_ROWS - 1;   // header takes one row
-        int first = _yo_msg - (rows - 1);
-        if (first < 0) first = 0;
-
-        int y = 31;
-        for (int i = first; i < yoMsgRows() && i < first + rows; i++, y += 11) {
-          drawPickerRow(display, y, i == _yo_msg,
-                        i == UI_YO_BACK_ROW ? UI_YO_BACK_LABEL : UI_YO_MESSAGES[i - 1]);
+        int y = 20;
+        for (int i = first; i < sendMsgRows() && i < first + UI_PICK_VISIBLE_ROWS; i++, y += 11) {
+          drawPickerRow(display, y, i == _read_msg_sel, UI_SEND_MESSAGES[i]);
         }
       } else {
-        display.setColor(UIColor::corp_blue);
-        display.drawXbm((display.width() - 32) / 2, 18, chat_icon, 32, 32);
-        display.setColor(UIColor::secondary_txt);
-        display.drawTextCentered(display.width() / 2, 64 - 11, UI_YO_TEXT ": " PRESS_LABEL);
+        readFetch();
+        if (_read_num == 0) {
+          display.setColor(UIColor::secondary_txt);
+          display.drawTextCentered(display.width() / 2, display.height() / 2 - 5,
+                                   "No messages");
+        } else {
+          const int rows = readVisibleRows(display);
+          // Count the lines first, so scrolling can stop at the point where the last line is
+          // on the bottom row -- scrolling further would just bring blank rows into view.
+          int total = readDrawLines(display, 0, 0);
+          int max_scroll = total - rows;
+          if (max_scroll < 0) max_scroll = 0;   // it all fits: nothing to scroll
+
+          // first render since boot: hold at the top for a full interval before scrolling
+          if (_read_next_scroll == 0) _read_next_scroll = millis() + UI_READ_SCROLL_MILLIS;
+
+          _read_scrolling = (max_scroll > 0);
+          if (_read_scrolling && millis() >= _read_next_scroll) {
+            _read_scroll = (_read_scroll >= max_scroll) ? 0 : _read_scroll + 1;
+            _read_next_scroll = millis() + UI_READ_SCROLL_MILLIS;
+          }
+          if (_read_scroll > max_scroll) _read_scroll = 0;   // messages arrived/aged out
+          readDrawLines(display, _read_scroll, rows);
+          if (max_scroll > 0) readDrawScrollbar(display, _read_scroll, total, rows);
+        }
       }
 #if ENV_INCLUDE_GPS == 1
     } else if (_page == HomePage::GPS) {
@@ -629,46 +819,67 @@ public:
         display.drawTextCentered(display.width() / 2, 64 - 11, "hibernate:" PRESS_LABEL);
       }
     }
+    // the READ page drives its own scrolling, so it needs re-rendering on that interval
+    if (_read_scrolling) return UI_READ_SCROLL_MILLIS;
     return 5000;   // next render after 5000 ms
   }
 
   bool handleInput(char c) override {
-    // the YO pickers are modal -- they swallow every key, so that a short press steps through
+    // the pickers are modal -- they swallow every key, so that a short press steps through
     // the list instead of paging the carousel
-    if (_yo_stage == YO_PICK_TARGET) {
+    if (_read_stage == READ_PICK_TARGET) {
+      _read_pick_expiry = millis() + UI_PICK_TIMEOUT_MILLIS;
       if (c == KEY_NEXT || c == KEY_RIGHT) {   // short press -> next row
-        _yo_sel = (_yo_sel + 1) % yoTargetRows();
-      } else if (c == KEY_ENTER) {   // long press -> activate the selected row
-        if (_yo_sel == UI_YO_BACK_ROW) {
-          _yo_stage = YO_IDLE;
-        } else {
-          _yo_msg = 1;   // start on the first message, not on Back
-          _yo_stage = YO_PICK_MSG;
-        }
+        _read_sel = (_read_sel + 1) % targetRows();
+      } else if (c == KEY_PREV || c == KEY_LEFT) {   // double-tap -> back, without picking
+        _read_stage = READ_VIEW;
+      } else if (c == KEY_ENTER) {   // long press -> read the selected conversation
+        _read_target = _targets[_read_sel];
+        readRestart();
+        // the message view has no title bar, so confirm the switch here instead
+        char alert[48];
+        snprintf(alert, sizeof(alert), "Reading: %s", _read_target.name);
+        _task->showAlert(alert, 1200);
+        _read_stage = READ_VIEW;
       }
       return true;
     }
-    if (_yo_stage == YO_PICK_MSG) {
+    if (_read_stage == READ_PICK_MSG) {
+      _read_pick_expiry = millis() + UI_PICK_TIMEOUT_MILLIS;
       if (c == KEY_NEXT || c == KEY_RIGHT) {   // short press -> next row
-        _yo_msg = (_yo_msg + 1) % yoMsgRows();
-      } else if (c == KEY_ENTER) {   // long press -> activate the selected row
-        if (_yo_msg == UI_YO_BACK_ROW) {
-          _yo_stage = YO_PICK_TARGET;
-        } else {
-          sendYo();
-          _yo_stage = YO_IDLE;
-        }
+        _read_msg_sel = (_read_msg_sel + 1) % sendMsgRows();
+      } else if (c == KEY_PREV || c == KEY_LEFT) {   // double-tap -> back, without sending
+        _read_stage = READ_VIEW;
+      } else if (c == KEY_ENTER) {   // long press -> send it
+        sendPickedMessage();
+        _read_stage = READ_VIEW;
+      }
+      return true;
+    }
+    // double-tap while reading -> pick a message to send to this conversation. Checked ahead
+    // of the carousel navigation below, which is what KEY_PREV normally does.
+    if ((c == KEY_PREV || c == KEY_LEFT) && _page == HomePage::READ) {
+      readEnsureTarget();
+      if (_read_target.name[0] == 0) {
+        _task->showAlert("Nothing to send to", 1200);
+      } else {
+        _read_msg_sel = 0;
+        _read_pick_expiry = millis() + UI_PICK_TIMEOUT_MILLIS;
+        _read_stage = READ_PICK_MSG;
       }
       return true;
     }
     if (c == KEY_LEFT || c == KEY_PREV) {
       _page = (_page + HomePage::Count - 1) % HomePage::Count;
+      if (_page == HomePage::READ) readRestart();
       return true;
     }
     if (c == KEY_NEXT || c == KEY_RIGHT) {
       _page = (_page + 1) % HomePage::Count;
       if (_page == HomePage::RECENT) {
         _task->showAlert("Recent adverts", 800);
+      } else if (_page == HomePage::READ) {
+        readRestart();   // always arrive at the top of the conversation
       }
       return true;
     }
@@ -689,12 +900,14 @@ public:
       }
       return true;
     }
-    if (c == KEY_ENTER && _page == HomePage::YO) {   // long press -> open the target picker
-      yoTakeSnapshot();
-      if (_yo_num == 0) {
-        _task->showAlert("Nothing to send to", 1200);
+    if (c == KEY_ENTER && _page == HomePage::READ) {   // long press -> pick what to read
+      takeTargetSnapshot();
+      if (_num_targets == 0) {
+        _task->showAlert("Nothing to read", 1200);
       } else {
-        _yo_stage = YO_PICK_TARGET;
+        _read_sel = 0;
+        _read_pick_expiry = millis() + UI_PICK_TIMEOUT_MILLIS;
+        _read_stage = READ_PICK_TARGET;
       }
       return true;
     }
@@ -968,6 +1181,17 @@ bool UITask::isButtonPressed() const {
 
 void UITask::loop() {
   char c = 0;
+
+  // Screens showing a long list opt out of multi-click detection, so that clicking quickly to
+  // scan down the list reports each press on its own instead of coalescing into double-clicks.
+  bool fast_clicks = (curr != NULL) && curr->wantsFastClicks();
+#if defined(PIN_USER_BTN)
+  user_btn.setMultiClick(!fast_clicks);
+#endif
+#if defined(PIN_USER_BTN_ANA)
+  analog_btn.setMultiClick(!fast_clicks);
+#endif
+
 #if UI_HAS_JOYSTICK
   int ev = user_btn.check();
   if (ev == BUTTON_EVENT_CLICK) {

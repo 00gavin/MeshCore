@@ -84,6 +84,30 @@ struct AdvertPath {
   uint8_t path[MAX_PATH_SIZE];
 };
 
+// How much message history to keep on the device, for the UI to display -- both received and
+// sent. Messages normally live in the companion app, not here, so this is deliberately a small
+// ring shared by every channel and contact: a chatty channel will push older DMs out of it.
+#ifndef MSG_HISTORY_SIZE
+  #define MSG_HISTORY_SIZE  32   // shared, so needs headroom above the 16 the UI shows
+#endif
+#ifndef MSG_HISTORY_TEXT_LEN
+  #define MSG_HISTORY_TEXT_LEN  100   // MAX_TEXT_LEN is 160; longer texts are truncated
+#endif
+
+struct MsgHistoryEntry {
+  // For direct messages this is the other party in the conversation -- the sender for an
+  // incoming message, the recipient for one we sent -- so both directions group together.
+  uint8_t  pubkey_prefix[7];
+  uint8_t  channel_idx;        // slot, for channel messages
+  bool     is_channel;
+  // For channel messages the payload already begins with "<sender>: ", so sender is left
+  // empty and text is shown as-is. For direct messages sender holds the display name: the
+  // contact for incoming, our own node name for outgoing.
+  char     sender[32];
+  char     text[MSG_HISTORY_TEXT_LEN];
+  uint32_t recv_timestamp;
+};
+
 class MyMesh : public BaseChatMesh, public DataStoreHost {
 public:
   MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store, AbstractUITask* ui=NULL);
@@ -110,6 +134,12 @@ public:
   void enterCLIRescue();
 
   int  getRecentlyHeard(AdvertPath dest[], int max_num);
+
+  // Copy the most recent messages for one channel / contact into dest, newest first.
+  // Returns how many were copied.
+  int  getChannelHistory(uint8_t channel_idx, MsgHistoryEntry dest[], int max_num);
+  int  getContactHistory(const uint8_t* pubkey_prefix, int prefix_len, MsgHistoryEntry dest[],
+                         int max_num);
 
 protected:
   float getAirtimeBudgetFactor() const override;
@@ -265,6 +295,12 @@ private:
 
   #define ADVERT_PATH_TABLE_SIZE   16
   AdvertPath advert_paths[ADVERT_PATH_TABLE_SIZE]; // circular table
+
+  MsgHistoryEntry msg_history[MSG_HISTORY_SIZE];   // circular table, oldest overwritten
+  int next_msg_idx;                                // where the next message will be written
+  MsgHistoryEntry* addMsgHistory();
+  int copyMsgHistory(bool is_channel, uint8_t channel_idx, const uint8_t* pubkey_prefix,
+                     int prefix_len, MsgHistoryEntry dest[], int max_num);
 };
 
 extern MyMesh the_mesh;

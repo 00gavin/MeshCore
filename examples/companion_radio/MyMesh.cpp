@@ -389,6 +389,43 @@ void MyMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path
   if (!is_new) dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY); // only schedule lazy write for contacts that are in contacts[]
 }
 
+// claim the next slot in the history ring, evicting the oldest entry
+MsgHistoryEntry* MyMesh::addMsgHistory() {
+  auto dest = &msg_history[next_msg_idx];
+  next_msg_idx = (next_msg_idx + 1) % MSG_HISTORY_SIZE;
+
+  memset(dest, 0, sizeof(*dest));
+  dest->recv_timestamp = getRTCClock()->getCurrentTime();
+  return dest;
+}
+
+// Walk the ring backwards from the write cursor, so dest comes out newest-first.
+int MyMesh::copyMsgHistory(bool is_channel, uint8_t channel_idx, const uint8_t* pubkey_prefix,
+                           int prefix_len, MsgHistoryEntry dest[], int max_num) {
+  int num = 0;
+  for (int n = 1; n <= MSG_HISTORY_SIZE && num < max_num; n++) {
+    auto src = &msg_history[(next_msg_idx - n + MSG_HISTORY_SIZE) % MSG_HISTORY_SIZE];
+    if (src->recv_timestamp == 0) continue;         // never written
+    if (src->is_channel != is_channel) continue;
+    if (is_channel) {
+      if (src->channel_idx != channel_idx) continue;
+    } else {
+      if (memcmp(src->pubkey_prefix, pubkey_prefix, prefix_len) != 0) continue;
+    }
+    dest[num++] = *src;
+  }
+  return num;
+}
+
+int MyMesh::getChannelHistory(uint8_t channel_idx, MsgHistoryEntry dest[], int max_num) {
+  return copyMsgHistory(true, channel_idx, NULL, 0, dest, max_num);
+}
+
+int MyMesh::getContactHistory(const uint8_t* pubkey_prefix, int prefix_len,
+                              MsgHistoryEntry dest[], int max_num) {
+  return copyMsgHistory(false, 0, pubkey_prefix, prefix_len, dest, max_num);
+}
+
 static int sort_by_recent(const void *a, const void *b) {
   return ((AdvertPath *) b)->recv_timestamp - ((AdvertPath *) a)->recv_timestamp;
 }
@@ -467,6 +504,12 @@ void MyMesh::queueMessage(const ContactInfo &from, uint8_t txt_type, mesh::Packe
 #ifdef DISPLAY_CLASS
   // we only want to show text messages on display, not cli data
   bool should_display = txt_type == TXT_TYPE_PLAIN || txt_type == TXT_TYPE_SIGNED_PLAIN;
+  if (should_display) {   // keep a copy for the READ page, whether or not the app is connected
+    auto h = addMsgHistory();
+    memcpy(h->pubkey_prefix, from.id.pub_key, sizeof(h->pubkey_prefix));
+    StrHelper::strncpy(h->sender, from.name, sizeof(h->sender));
+    StrHelper::strncpy(h->text, text, sizeof(h->text));
+  }
   if (should_display && _ui) {
     _ui->newMsg(path_len, from.name, text, offline_queue_len);
     if (!_serial->isConnected()) {
@@ -579,6 +622,13 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
 #endif
   }
 #ifdef DISPLAY_CLASS
+  {   // keep a copy for the READ page. The payload already leads with "<sender>: ".
+    auto h = addMsgHistory();
+    h->is_channel = true;
+    h->channel_idx = channel_idx;
+    StrHelper::strncpy(h->text, text, sizeof(h->text));
+  }
+
   // Get the channel name from the channel index
   const char *channel_name = "Unknown";
   ChannelDetails channel_details;
@@ -872,6 +922,8 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   sign_data = NULL;
   dirty_contacts_expiry = 0;
   memset(advert_paths, 0, sizeof(advert_paths));
+  next_msg_idx = 0;
+  memset(msg_history, 0, sizeof(msg_history));
   memset(send_scope.key, 0, sizeof(send_scope.key));
   send_unscoped = false;
 
@@ -2269,10 +2321,18 @@ int MyMesh::sendTextToChannelIdx(uint8_t channel_idx, const char* text) {
 
   // getCurrentTimeUnique() (rather than getCurrentTime()) as the timestamp also seeds the
   // packet hash -- sending the same text twice in one second would otherwise collide
-  return sendGroupMessage(getRTCClock()->getCurrentTimeUnique(), channel.channel,
-                          _prefs.node_name, text, strlen(text))
-             ? CHANNEL_TXT_OK
-             : CHANNEL_TXT_SEND_FAILED;
+  if (!sendGroupMessage(getRTCClock()->getCurrentTimeUnique(), channel.channel,
+                        _prefs.node_name, text, strlen(text))) {
+    return CHANNEL_TXT_SEND_FAILED;
+  }
+
+  // keep a copy so the READ page shows our own messages alongside the received ones. Stored
+  // in the same "<sender>: <msg>" shape that sendGroupMessage() puts on the wire.
+  auto h = addMsgHistory();
+  h->is_channel = true;
+  h->channel_idx = channel_idx;
+  snprintf(h->text, sizeof(h->text), "%s: %s", _prefs.node_name, text);
+  return CHANNEL_TXT_OK;
 }
 
 // Send a plain text direct message to the contact matching the given public key prefix.
@@ -2296,6 +2356,13 @@ int MyMesh::sendTextToNode(const uint8_t* pubkey_prefix, int prefix_len, const c
     expected_ack_table[next_ack_idx].contact = recipient;
     next_ack_idx = (next_ack_idx + 1) % EXPECTED_ACK_TABLE_SIZE;
   }
+
+  // Keep a copy so the READ page shows our own messages alongside the received ones. Filed
+  // under the recipient's key, not ours, so both directions land in the one conversation.
+  auto h = addMsgHistory();
+  memcpy(h->pubkey_prefix, recipient->id.pub_key, sizeof(h->pubkey_prefix));
+  StrHelper::strncpy(h->sender, _prefs.node_name, sizeof(h->sender));
+  StrHelper::strncpy(h->text, text, sizeof(h->text));
   return NODE_TXT_OK;
 }
 
