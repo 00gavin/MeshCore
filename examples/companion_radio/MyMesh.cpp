@@ -390,13 +390,59 @@ void MyMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path
   if (!is_new) dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY); // only schedule lazy write for contacts that are in contacts[]
 }
 
-// claim the next slot in the history ring, evicting the oldest entry
-MsgHistoryEntry* MyMesh::addMsgHistory() {
+// Reserve `need` contiguous bytes in the shared character block, retiring whatever older
+// entries still own them. A message is never split across the end of the block -- the leftover
+// tail is abandoned and writing restarts at the front -- so every stored string stays a single
+// contiguous run that can be handed straight back as a const char*.
+int MyMesh::claimMsgChars(int need) {
+  if (need > MSG_HISTORY_CHARS) return -1;   // longer than the whole block; cannot be stored
+
+  int start = next_char_idx;
+  if (start + need > MSG_HISTORY_CHARS) start = 0;   // would overrun the end, so begin again
+  int end = start + need;
+
+  // Anything whose characters lie in the stretch being taken has just lost its text, so retire
+  // it now rather than leave an entry pointing at bytes that are about to say something else.
+  for (int i = 0; i < MSG_HISTORY_SIZE; i++) {
+    auto old = &msg_history[i];
+    if (old->recv_timestamp == 0) continue;          // already retired, or never written
+    if (old->char_pos < end && start < old->char_pos + old->char_len) {
+      old->recv_timestamp = 0;
+    }
+  }
+
+  next_char_idx = (end >= MSG_HISTORY_CHARS) ? 0 : end;
+  return start;
+}
+
+// claim the next slot in the history ring, evicting the oldest entry, and copy this message's
+// strings into the shared character block
+MsgHistoryEntry* MyMesh::addMsgHistory(const char* sender, const char* text) {
+  if (sender == NULL) sender = "";
+  if (text == NULL) text = "";
+
+  int sender_len = strlen(sender);
+  if (sender_len > MSG_HISTORY_SENDER_LEN) sender_len = MSG_HISTORY_SENDER_LEN;
+  int text_len = strlen(text);
+  if (text_len > MAX_TEXT_LEN) text_len = MAX_TEXT_LEN;
+
+  int need = sender_len + text_len + 2;   // a terminator after each
+  int pos = claimMsgChars(need);
+  if (pos < 0) return NULL;
+
   auto dest = &msg_history[next_msg_idx];
   next_msg_idx = (next_msg_idx + 1) % MSG_HISTORY_SIZE;
   msg_history_version++;
 
+  memcpy(&msg_chars[pos], sender, sender_len);
+  msg_chars[pos + sender_len] = 0;
+  memcpy(&msg_chars[pos + sender_len + 1], text, text_len);
+  msg_chars[pos + sender_len + 1 + text_len] = 0;
+
   memset(dest, 0, sizeof(*dest));
+  dest->sender_len = (uint8_t) sender_len;
+  dest->char_pos = (uint16_t) pos;
+  dest->char_len = (uint16_t) need;
   dest->recv_timestamp = getRTCClock()->getCurrentTime();
   return dest;
 }
@@ -436,6 +482,16 @@ int MyMesh::getContactHistory(const uint8_t* pubkey_prefix, int prefix_len,
 const MsgHistoryEntry* MyMesh::getMsgHistoryEntry(uint8_t idx) const {
   if (idx >= MSG_HISTORY_SIZE) return NULL;
   return &msg_history[idx];
+}
+
+const char* MyMesh::getMsgSender(const MsgHistoryEntry* entry) const {
+  if (entry == NULL || entry->recv_timestamp == 0) return "";
+  return &msg_chars[entry->char_pos];
+}
+
+const char* MyMesh::getMsgText(const MsgHistoryEntry* entry) const {
+  if (entry == NULL || entry->recv_timestamp == 0) return "";
+  return &msg_chars[entry->char_pos + entry->sender_len + 1];
 }
 
 // The ring is small, so the newest entry for one conversation is cheapest to find by just
@@ -530,10 +586,8 @@ void MyMesh::queueMessage(const ContactInfo &from, uint8_t txt_type, mesh::Packe
   // we only want to show text messages on display, not cli data
   bool should_display = txt_type == TXT_TYPE_PLAIN || txt_type == TXT_TYPE_SIGNED_PLAIN;
   if (should_display) {   // keep a copy for the READ page, whether or not the app is connected
-    auto h = addMsgHistory();
-    memcpy(h->pubkey_prefix, from.id.pub_key, sizeof(h->pubkey_prefix));
-    StrHelper::strncpy(h->sender, from.name, sizeof(h->sender));
-    StrHelper::strncpy(h->text, text, sizeof(h->text));
+    auto h = addMsgHistory(from.name, text);
+    if (h) memcpy(h->pubkey_prefix, from.id.pub_key, sizeof(h->pubkey_prefix));
   }
   if (should_display && _ui) {
     _ui->newMsg(path_len, from.name, text, offline_queue_len);
@@ -648,10 +702,12 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
   }
 #ifdef DISPLAY_CLASS
   {   // keep a copy for the READ page. The payload already leads with "<sender>: ".
-    auto h = addMsgHistory();
-    h->is_channel = true;
-    h->channel_idx = channel_idx;
-    StrHelper::strncpy(h->text, text, sizeof(h->text));
+    // a received channel payload already leads with "<sender>: ", so it is stored as-is
+    auto h = addMsgHistory(NULL, text);
+    if (h) {
+      h->is_channel = true;
+      h->channel_idx = channel_idx;
+    }
   }
 
   // Get the channel name from the channel index
@@ -949,6 +1005,7 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   memset(advert_paths, 0, sizeof(advert_paths));
   next_msg_idx = 0;
   msg_history_version = 0;
+  next_char_idx = 0;
   memset(msg_history, 0, sizeof(msg_history));
   memset(send_scope.key, 0, sizeof(send_scope.key));
   send_unscoped = false;
@@ -2354,10 +2411,14 @@ int MyMesh::sendTextToChannelIdx(uint8_t channel_idx, const char* text) {
 
   // keep a copy so the READ page shows our own messages alongside the received ones. Stored
   // in the same "<sender>: <msg>" shape that sendGroupMessage() puts on the wire.
-  auto h = addMsgHistory();
-  h->is_channel = true;
-  h->channel_idx = channel_idx;
-  snprintf(h->text, sizeof(h->text), "%s: %s", _prefs.node_name, text);
+  // Nothing prefixed our own name onto this one the way an incoming payload would have, so
+  // keep it in the name field instead of pasting it onto the front of the text. The reader
+  // renders the two the same way.
+  auto h = addMsgHistory(_prefs.node_name, text);
+  if (h) {
+    h->is_channel = true;
+    h->channel_idx = channel_idx;
+  }
   return CHANNEL_TXT_OK;
 }
 
@@ -2385,10 +2446,8 @@ int MyMesh::sendTextToNode(const uint8_t* pubkey_prefix, int prefix_len, const c
 
   // Keep a copy so the READ page shows our own messages alongside the received ones. Filed
   // under the recipient's key, not ours, so both directions land in the one conversation.
-  auto h = addMsgHistory();
-  memcpy(h->pubkey_prefix, recipient->id.pub_key, sizeof(h->pubkey_prefix));
-  StrHelper::strncpy(h->sender, _prefs.node_name, sizeof(h->sender));
-  StrHelper::strncpy(h->text, text, sizeof(h->text));
+  auto h = addMsgHistory(_prefs.node_name, text);
+  if (h) memcpy(h->pubkey_prefix, recipient->id.pub_key, sizeof(h->pubkey_prefix));
   return NODE_TXT_OK;
 }
 

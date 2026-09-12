@@ -454,21 +454,25 @@ class HomeScreen : public UIScreen {
   // line at the top is usually part-way off screen; the display driver clips it.
   int readDrawLines(DisplayDriver& display, int scroll_px, bool draw) {
     // room for the longest message, the sender, and the age prefix in front of both
-    char composed[sizeof(MsgHistoryEntry::sender) + sizeof(MsgHistoryEntry::text) + 16];
+    char composed[MSG_HISTORY_SENDER_LEN + MAX_TEXT_LEN + 16];
     char shown[sizeof(composed)];
     char age[12];
     int line = 0;
 
     for (int m = 0; m < _read_num; m++) {
       auto msg = the_mesh.getMsgHistoryEntry(_read_idx[m]);
-      if (msg == NULL) continue;
+      if (msg == NULL || msg->recv_timestamp == 0) continue;   // retired since it was listed
+
+      const char* sender = the_mesh.getMsgSender(msg);
+      const char* body = the_mesh.getMsgText(msg);
 
       readFormatAge(age, sizeof(age), msg->recv_timestamp);
-      // channel payloads already lead with "<sender>: "; DMs need the contact name prepended
-      if (msg->sender[0] != 0) {
-        snprintf(composed, sizeof(composed), "%s %s: %s", age, msg->sender, msg->text);
+      // received channel payloads already lead with "<sender>: "; everything else keeps the
+      // name separately, so it has to be put back in front here
+      if (sender[0] != 0) {
+        snprintf(composed, sizeof(composed), "%s %s: %s", age, sender, body);
       } else {
-        snprintf(composed, sizeof(composed), "%s %s", age, msg->text);
+        snprintf(composed, sizeof(composed), "%s %s", age, body);
       }
 
       // A message can carry newlines, and translateUTF8ToBlocks drops anything outside printable

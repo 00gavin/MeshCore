@@ -86,15 +86,33 @@ struct AdvertPath {
 };
 
 // How much message history to keep on the device, for the UI to display -- both received and
-// sent. Messages normally live in the companion app, not here, so this is deliberately a small
-// ring shared by every channel and contact: a chatty channel will push older DMs out of it.
+// sent. Messages normally live in the companion app, not here, so this is a ring shared by
+// every channel and contact: a chatty channel will push older DMs out of it.
 #ifndef MSG_HISTORY_SIZE
-  #define MSG_HISTORY_SIZE  32   // shared, so needs headroom above the 16 the UI shows
+  #define MSG_HISTORY_SIZE  128
 #endif
-// Big enough for the longest message the radio can carry, so nothing is lost on the way into
-// the ring -- anything shorter would silently clip long messages rather than let them wrap.
-#ifndef MSG_HISTORY_TEXT_LEN
-  #define MSG_HISTORY_TEXT_LEN  (MAX_TEXT_LEN + 1)
+// Room for the text of those messages, in bytes. Entries deliberately do not carry a
+// full-length buffer each: almost every message is far shorter than the longest the radio can
+// carry, so reserving the worst case on every slot would cost several times what the entire
+// history does. They share this block instead, and an entry is retired when a newer message
+// needs the bytes it was using -- so in practice this, rather than MSG_HISTORY_SIZE, is what
+// decides how far back the history really reaches.
+#ifndef MSG_HISTORY_CHARS
+  #define MSG_HISTORY_CHARS  4096
+#endif
+
+// Longest display name stored alongside a message. Names are truncated to fit rather than
+// being allowed to crowd out message text.
+#define MSG_HISTORY_SENDER_LEN  31
+
+#if MSG_HISTORY_SIZE > 255
+  #error "MSG_HISTORY_SIZE must fit in a uint8_t -- entries are referred to by ring index"
+#endif
+#if MSG_HISTORY_CHARS > 65535
+  #error "MSG_HISTORY_CHARS must fit in a uint16_t -- that is what addresses the block"
+#endif
+#if MSG_HISTORY_CHARS < (MSG_HISTORY_SENDER_LEN + MAX_TEXT_LEN + 2)
+  #error "MSG_HISTORY_CHARS cannot hold even one full-length message"
 #endif
 
 struct MsgHistoryEntry {
@@ -103,11 +121,18 @@ struct MsgHistoryEntry {
   uint8_t  pubkey_prefix[7];
   uint8_t  channel_idx;        // slot, for channel messages
   bool     is_channel;
-  // For channel messages the payload already begins with "<sender>: ", so sender is left
-  // empty and text is shown as-is. For direct messages sender holds the display name: the
-  // contact for incoming, our own node name for outgoing.
-  char     sender[32];
-  char     text[MSG_HISTORY_TEXT_LEN];
+  // The sender name and the message text sit back to back in the shared character block, each
+  // terminated, starting at char_pos and taking char_len bytes between them. Read them through
+  // MyMesh::getMsgSender() / getMsgText() rather than indexing the block directly.
+  //
+  // A received channel message already begins "<sender>: ", so its name is left empty and the
+  // text shown as-is. Everywhere else the name is held separately: the contact for an incoming
+  // direct message, our own node name for anything we sent.
+  uint8_t  sender_len;
+  uint16_t char_pos;
+  uint16_t char_len;
+  // Zero marks a slot never written, or one retired because a newer message claimed the
+  // characters it had been using. Such a slot has no valid text behind it.
   uint32_t recv_timestamp;
 };
 
@@ -151,6 +176,10 @@ public:
   int  getContactHistory(const uint8_t* pubkey_prefix, int prefix_len, uint8_t dest[],
                          int max_num);
   const MsgHistoryEntry* getMsgHistoryEntry(uint8_t idx) const;
+  // The two strings behind an entry. Both return "" for a slot that has been retired, so a
+  // caller that held on to an index across a new message still gets something printable.
+  const char* getMsgSender(const MsgHistoryEntry* entry) const;
+  const char* getMsgText(const MsgHistoryEntry* entry) const;
 
   // recv_timestamp of the most recent message for one channel / contact, or 0 if it has none
   // in the ring. Lets the UI tell which conversations have something new without listing them.
@@ -315,7 +344,10 @@ private:
   MsgHistoryEntry msg_history[MSG_HISTORY_SIZE];   // circular table, oldest overwritten
   int next_msg_idx;                                // where the next message will be written
   uint32_t msg_history_version;                    // see getMsgHistoryVersion()
-  MsgHistoryEntry* addMsgHistory();
+  char msg_chars[MSG_HISTORY_CHARS];               // shared text block, also written circularly
+  int next_char_idx;                               // where the next message's text will go
+  MsgHistoryEntry* addMsgHistory(const char* sender, const char* text);
+  int claimMsgChars(int need);
   bool msgMatchesTarget(const MsgHistoryEntry* src, bool is_channel, uint8_t channel_idx,
                         const uint8_t* pubkey_prefix, int prefix_len) const;
   int listMsgHistory(bool is_channel, uint8_t channel_idx, const uint8_t* pubkey_prefix,
