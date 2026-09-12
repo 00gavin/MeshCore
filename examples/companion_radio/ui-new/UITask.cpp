@@ -63,6 +63,9 @@ static const char* const UI_SEND_MESSAGES[] = {
 #ifndef UI_READ_TOP_MILLIS
   #define UI_READ_TOP_MILLIS  5000   // but hold longer at the top, on the newest message
 #endif
+#ifndef UI_READ_BOTTOM_MILLIS
+  #define UI_READ_BOTTOM_MILLIS  3000   // and at the bottom, before wrapping round again
+#endif
 // The message view hides the title bar and uses the full height, so the row count comes from
 // the display rather than being fixed. 11px matches the line spacing used elsewhere.
 #define UI_READ_LINE_HEIGHT  11
@@ -125,7 +128,6 @@ public:
 
 class HomeScreen : public UIScreen {
   enum HomePage {
-    READ,      // first, so the device wakes up showing messages
     STATUS,
     RECENT,
     RADIO,
@@ -138,7 +140,8 @@ class HomeScreen : public UIScreen {
     SENSORS,
 #endif
     SHUTDOWN,
-    Count    // keep as last
+    READ,      // last page in the carousel
+    Count      // keep as last
   };
 
   UITask* _task;
@@ -178,16 +181,19 @@ class HomeScreen : public UIScreen {
   MsgHistoryEntry _read_msgs[UI_READ_MSG_COUNT];
   int  _read_num;
 
-  // How long the current line stays put. The top of the list holds longer, so the newest
-  // message can be read without having to catch it mid-scroll.
-  unsigned long readHoldMillis() const {
-    return (_read_scroll == 0) ? UI_READ_TOP_MILLIS : UI_READ_SCROLL_MILLIS;
+  // How long the current line stays put. Both ends of the conversation dwell longer than the
+  // lines in between: the top so the newest message can be read without catching it
+  // mid-scroll, the bottom so the oldest isn't whipped away as it wraps round.
+  unsigned long readHoldMillis(int max_scroll) const {
+    if (_read_scroll <= 0) return UI_READ_TOP_MILLIS;
+    if (_read_scroll >= max_scroll) return UI_READ_BOTTOM_MILLIS;
+    return UI_READ_SCROLL_MILLIS;
   }
 
   // back to the top, and hold there before scrolling starts
   void readRestart() {
     _read_scroll = 0;
-    _read_next_scroll = millis() + readHoldMillis();
+    _read_next_scroll = millis() + UI_READ_TOP_MILLIS;
   }
 
   int targetRows() const { return _num_targets; }
@@ -677,13 +683,13 @@ public:
           if (max_scroll < 0) max_scroll = 0;   // it all fits: nothing to scroll
 
           // first render since boot: hold at the top for a full interval before scrolling
-          if (_read_next_scroll == 0) _read_next_scroll = millis() + readHoldMillis();
+          if (_read_next_scroll == 0) _read_next_scroll = millis() + readHoldMillis(max_scroll);
 
           _read_scrolling = (max_scroll > 0);
           if (_read_scrolling && millis() >= _read_next_scroll) {
             _read_scroll = (_read_scroll >= max_scroll) ? 0 : _read_scroll + 1;
-            // readHoldMillis() reads the new position, so wrapping back to the top holds long
-            _read_next_scroll = millis() + readHoldMillis();
+            // readHoldMillis() reads the new position, so landing on either end holds longer
+            _read_next_scroll = millis() + readHoldMillis(max_scroll);
           }
           if (_read_scroll > max_scroll) _read_scroll = 0;   // messages arrived/aged out
           readDrawLines(display, _read_scroll, rows);
