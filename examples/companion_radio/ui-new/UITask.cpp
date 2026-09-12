@@ -180,7 +180,7 @@ class HomeScreen : public UIScreen {
   int  _read_scroll;                   // index of the first visible wrapped line
   unsigned long _read_next_scroll;     // when the text next advances a line
   bool _read_scrolling;                // there is more text than fits, so keep re-rendering
-  bool _read_cycle_done;               // a full scroll has completed; stop holding sleep off
+  int  _read_cycles_left;              // full scrolls still owed before sleep is allowed again
   PickTarget _read_target;             // what is being read (lazily defaulted to Public)
   MsgHistoryEntry _read_msgs[UI_READ_MSG_COUNT];
   int  _read_num;
@@ -198,7 +198,7 @@ class HomeScreen : public UIScreen {
   // switching conversation) earns another uninterrupted scroll through.
   void readRestart() {
     _read_scroll = 0;
-    _read_cycle_done = false;
+    _read_cycles_left = 1;
     _read_next_scroll = millis() + UI_READ_TOP_MILLIS;
   }
 
@@ -509,7 +509,7 @@ public:
      : _task(task), _rtc(rtc), _sensors(sensors), _node_prefs(node_prefs), _page(0),
        _shutdown_init(false), _num_targets(0), _read_stage(READ_VIEW), _read_sel(0),
        _read_msg_sel(0), _read_pick_expiry(0), _read_scroll(0), _read_next_scroll(0),
-       _read_scrolling(false), _read_cycle_done(false), _read_num(0), sensors_lpp(200) {
+       _read_scrolling(false), _read_cycles_left(1), _read_num(0), sensors_lpp(200) {
     memset(&_read_target, 0, sizeof(_read_target));
   }
 
@@ -529,13 +529,20 @@ public:
     return _page == HomePage::READ && _read_stage != READ_VIEW;
   }
 
-  // Hold the display on once the conversation has started scrolling, so a long one can be read
-  // right through. Released when it wraps back to the top, or the page is left. The
-  // _read_cycle_done latch matters: without it the next cycle would start holding again a few
-  // seconds later and the display would never blank at all.
+  // Hold the display on while the conversation is part-way through a scroll it still owes the
+  // user. The counter matters: without it a fresh cycle would start holding again seconds
+  // after the last one ended, and the display would never blank at all.
   bool preventsSleep() const override {
     return _page == HomePage::READ && _read_stage == READ_VIEW
-           && _read_scroll > 0 && !_read_cycle_done;
+           && _read_scroll > 0 && _read_cycles_left > 0;
+  }
+
+  // Woken from the auto-off blank. Waking part-way down a conversation means the rest of that
+  // pass was missed, so cover what remains of it plus one more pass from the top; waking at
+  // the top only needs the usual single pass.
+  void onDisplayWake() override {
+    if (_page != HomePage::READ || _read_stage != READ_VIEW) return;
+    _read_cycles_left = (_read_scroll > 0) ? 2 : 1;
   }
 
   int render(DisplayDriver& display) override {
@@ -695,7 +702,7 @@ public:
           if (_read_scrolling && millis() >= _read_next_scroll) {
             if (_read_scroll >= max_scroll) {
               _read_scroll = 0;                  // wrap round to the newest message
-              _read_cycle_done = true;           // seen it all; let the display sleep again
+              if (_read_cycles_left > 0) _read_cycles_left--;   // that pass is now paid off
             } else {
               _read_scroll += UI_READ_SCROLL_STEP;
               if (_read_scroll > max_scroll) _read_scroll = max_scroll;   // land on the end
@@ -1372,6 +1379,7 @@ char UITask::checkDisplayOn(char c) {
     if (!_display->isOn()) {
       _display->turnOn();   // turn display on and consume event
       c = 0;
+      if (curr) curr->onDisplayWake();
     }
     _auto_off = millis() + AUTO_OFF_MILLIS;   // extend auto-off timer
     _next_refresh = 0;  // trigger refresh

@@ -28,5 +28,7 @@ public:
   // True while the screen is mid-way through something the user should be allowed to watch to
   // completion, and the display must not blank. Expected to go false again on its own.
   virtual bool preventsSleep() const { return false; }
+  // Called when the display is woken from its auto-off blank while this screen is showing.
+  virtual void onDisplayWake() { }
 };
 
