@@ -58,7 +58,7 @@ static const char* const UI_SEND_MESSAGES[] = {
   #define UI_READ_MSG_COUNT  16
 #endif
 #ifndef UI_READ_SCROLL_MILLIS
-  #define UI_READ_SCROLL_MILLIS  2000   // advance the text one line this often
+  #define UI_READ_SCROLL_MILLIS  1000   // advance the text by one step this often
 #endif
 #ifndef UI_READ_TOP_MILLIS
   #define UI_READ_TOP_MILLIS  5000   // but hold longer at the top, on the newest message
@@ -69,6 +69,9 @@ static const char* const UI_SEND_MESSAGES[] = {
 // The message view hides the title bar and uses the full height, so the row count comes from
 // the display rather than being fixed. 11px matches the line spacing used elsewhere.
 #define UI_READ_LINE_HEIGHT  11
+// Scrolling is by pixels, not whole lines, so the text creeps rather than jumping a line at a
+// time. Half a line per step keeps the average speed close to a line every two seconds.
+#define UI_READ_SCROLL_STEP  (UI_READ_LINE_HEIGHT / 2)
 #define UI_READ_SCROLLBAR_W  2   // scrollbar down the right edge of the message view
 
 #include "icons.h"
@@ -258,14 +261,6 @@ class HomeScreen : public UIScreen {
     return fits > 0 ? fits : 1;
   }
 
-  // How many text rows fit, given that the message view gets the whole display. Rounded up:
-  // glyphs are a good deal shorter than the 11px line spacing (6px on most of these panels),
-  // so the bottom row still renders in full even though 64 isn't a multiple of the spacing.
-  int readVisibleRows(DisplayDriver& display) const {
-    int rows = (display.height() + UI_READ_LINE_HEIGHT - 1) / UI_READ_LINE_HEIGHT;
-    return (rows > 0) ? rows : 1;
-  }
-
   // Width available to text. The scrollbar gutter is reserved whether or not the bar is
   // actually drawn, so that the wrapped line count doesn't change as it appears/disappears.
   int readTextWidth(DisplayDriver& display) const {
@@ -276,28 +271,28 @@ class HomeScreen : public UIScreen {
   // the conversation on screen, its position is how far down that window sits. Deliberately no
   // background track -- every display driver here defines primary_txt and secondary_txt as the
   // same colour, so a track would merge with the thumb into one featureless bar.
-  void readDrawScrollbar(DisplayDriver& display, int scroll, int total, int rows) {
+  void readDrawScrollbar(DisplayDriver& display, int scroll_px, int total_px) {
     int h = display.height();
     int x = display.width() - UI_READ_SCROLLBAR_W;
 
-    int thumb = (h * rows) / total;
+    int thumb = (h * h) / total_px;
     if (thumb < 3) thumb = 3;          // keep it visible on very long conversations
     if (thumb > h) thumb = h;
 
-    int max_scroll = total - rows;
-    int y = (max_scroll > 0) ? ((h - thumb) * scroll) / max_scroll : 0;
+    int max_scroll = total_px - h;
+    int y = (max_scroll > 0) ? ((h - thumb) * scroll_px) / max_scroll : 0;
 
     display.setColor(UIColor::primary_txt);
     display.fillRect(x, y, UI_READ_SCROLLBAR_W, thumb);
   }
 
-  // Draw the wrapped message lines falling inside [first, first + rows), and return the total
-  // line count. Pass rows = 0 to count without drawing.
-  int readDrawLines(DisplayDriver& display, int first, int rows) {
+  // Draw the wrapped message lines, shifted up by scroll_px, and return the total line count.
+  // Pass draw = false to count the lines without rendering. Scrolling is by pixels, so the
+  // line at the top is usually part-way off screen; the display driver clips it.
+  int readDrawLines(DisplayDriver& display, int scroll_px, bool draw) {
     char composed[sizeof(_read_msgs[0].sender) + sizeof(_read_msgs[0].text) + 4];
     char shown[sizeof(composed)];
     int line = 0;
-    int y = 0;   // no title bar on this page, so start at the very top
 
     for (int m = 0; m < _read_num; m++) {
       auto msg = &_read_msgs[m];
@@ -309,22 +304,19 @@ class HomeScreen : public UIScreen {
       }
       display.translateUTF8ToBlocks(shown, composed, sizeof(shown));
 
-      bool is_first_line = true;
       for (const char* p = shown; *p; ) {
         int n = readWrapPoint(display, p, readTextWidth(display));
-        if (line >= first && line < first + rows) {
+        int y = line * UI_READ_LINE_HEIGHT - scroll_px;
+        if (draw && y > -UI_READ_LINE_HEIGHT && y < display.height()) {
           char row[64];
           int len = (n < (int)sizeof(row) - 1) ? n : (int)sizeof(row) - 1;
           memcpy(row, p, len);
           row[len] = 0;
-          // dim the continuation lines, so where each message starts stays readable
-          display.setColor(is_first_line ? UIColor::primary_txt : UIColor::secondary_txt);
+          display.setColor(UIColor::primary_txt);
           display.setCursor(0, y);
           display.print(row);
-          y += UI_READ_LINE_HEIGHT;
         }
         line++;
-        is_first_line = false;
         p += n;
         while (*p == ' ') p++;   // don't start the next line on the break space
       }
@@ -675,11 +667,10 @@ public:
           display.drawTextCentered(display.width() / 2, display.height() / 2 - 5,
                                    "No messages");
         } else {
-          const int rows = readVisibleRows(display);
-          // Count the lines first, so scrolling can stop at the point where the last line is
-          // on the bottom row -- scrolling further would just bring blank rows into view.
-          int total = readDrawLines(display, 0, 0);
-          int max_scroll = total - rows;
+          // Measure the text first, so scrolling can stop once the last line sits on the
+          // bottom of the screen -- going further would just pull blank space into view.
+          int total_px = readDrawLines(display, 0, false) * UI_READ_LINE_HEIGHT;
+          int max_scroll = total_px - display.height();
           if (max_scroll < 0) max_scroll = 0;   // it all fits: nothing to scroll
 
           // first render since boot: hold at the top for a full interval before scrolling
@@ -687,13 +678,18 @@ public:
 
           _read_scrolling = (max_scroll > 0);
           if (_read_scrolling && millis() >= _read_next_scroll) {
-            _read_scroll = (_read_scroll >= max_scroll) ? 0 : _read_scroll + 1;
+            if (_read_scroll >= max_scroll) {
+              _read_scroll = 0;                  // wrap round to the newest message
+            } else {
+              _read_scroll += UI_READ_SCROLL_STEP;
+              if (_read_scroll > max_scroll) _read_scroll = max_scroll;   // land on the end
+            }
             // readHoldMillis() reads the new position, so landing on either end holds longer
             _read_next_scroll = millis() + readHoldMillis(max_scroll);
           }
           if (_read_scroll > max_scroll) _read_scroll = 0;   // messages arrived/aged out
-          readDrawLines(display, _read_scroll, rows);
-          if (max_scroll > 0) readDrawScrollbar(display, _read_scroll, total, rows);
+          readDrawLines(display, _read_scroll, true);
+          if (max_scroll > 0) readDrawScrollbar(display, _read_scroll, total_px);
         }
       }
 #if ENV_INCLUDE_GPS == 1
