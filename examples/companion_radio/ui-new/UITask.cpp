@@ -400,6 +400,7 @@ class HomeScreen : public UIScreen {
     int n = the_mesh.getRecentlyHeard(_recent_scratch, UI_TARGET_RECENT_MAX);
     for (int i = 0; i < n && _num_targets < UI_TARGET_LIST_SIZE; i++) {
       if (_recent_scratch[i].name[0] == 0) continue;   // empty slot
+      if (_recent_scratch[i].type == ADV_TYPE_REPEATER) continue;   // nothing to say to one
 
       auto dest = newTarget();
       memcpy(dest->pubkey_prefix, _recent_scratch[i].pubkey_prefix, sizeof(dest->pubkey_prefix));
@@ -408,12 +409,14 @@ class HomeScreen : public UIScreen {
   }
 
   // Favourites are worth being able to reach even when they haven't been heard from lately,
-  // so append any the recently-heard list didn't already cover.
+  // so append any the recently-heard list didn't already cover. Repeaters are skipped even
+  // when favourited: they are infrastructure, not something to send a message to.
   void appendFavouriteTargets() {
     ContactInfo contact;
     auto iter = the_mesh.startContactsIterator();
     while (_num_targets < UI_TARGET_LIST_SIZE && iter.hasNext(&the_mesh, contact)) {
       if ((contact.flags & CONTACT_FLAG_FAVOURITE) == 0) continue;
+      if (contact.type == ADV_TYPE_REPEATER) continue;
       if (contact.name[0] == 0 || targetAlreadyListed(contact.id.pub_key)) continue;
 
       auto dest = newTarget();

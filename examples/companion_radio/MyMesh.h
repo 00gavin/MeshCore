@@ -79,6 +79,7 @@
 struct AdvertPath {
   uint8_t pubkey_prefix[7];
   uint8_t path_len;
+  uint8_t type;                // one of ADV_TYPE_*, captured when the advert was heard
   char    name[32];
   uint32_t recv_timestamp;
   uint8_t path[MAX_PATH_SIZE];
