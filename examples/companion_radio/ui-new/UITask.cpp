@@ -61,10 +61,10 @@ static const char* const UI_SEND_MESSAGES[] = {
   #define UI_READ_SCROLL_MILLIS  1000   // advance the text by one step this often
 #endif
 #ifndef UI_READ_TOP_MILLIS
-  #define UI_READ_TOP_MILLIS  5000   // but hold longer at the top, on the newest message
+  #define UI_READ_TOP_MILLIS  4000   // but hold longer at the top, on the newest message
 #endif
 #ifndef UI_READ_BOTTOM_MILLIS
-  #define UI_READ_BOTTOM_MILLIS  3000   // and at the bottom, before wrapping round again
+  #define UI_READ_BOTTOM_MILLIS  2000   // and at the bottom, before wrapping round again
 #endif
 // The message view hides the title bar and uses the full height, so the row count comes from
 // the display rather than being fixed. 11px matches the line spacing used elsewhere.
@@ -180,6 +180,7 @@ class HomeScreen : public UIScreen {
   int  _read_scroll;                   // index of the first visible wrapped line
   unsigned long _read_next_scroll;     // when the text next advances a line
   bool _read_scrolling;                // there is more text than fits, so keep re-rendering
+  bool _read_cycle_done;               // a full scroll has completed; stop holding sleep off
   PickTarget _read_target;             // what is being read (lazily defaulted to Public)
   MsgHistoryEntry _read_msgs[UI_READ_MSG_COUNT];
   int  _read_num;
@@ -193,9 +194,11 @@ class HomeScreen : public UIScreen {
     return UI_READ_SCROLL_MILLIS;
   }
 
-  // back to the top, and hold there before scrolling starts
+  // back to the top, and hold there before scrolling starts. Arriving fresh on the page (or
+  // switching conversation) earns another uninterrupted scroll through.
   void readRestart() {
     _read_scroll = 0;
+    _read_cycle_done = false;
     _read_next_scroll = millis() + UI_READ_TOP_MILLIS;
   }
 
@@ -503,7 +506,7 @@ public:
      : _task(task), _rtc(rtc), _sensors(sensors), _node_prefs(node_prefs), _page(0),
        _shutdown_init(false), _num_targets(0), _read_stage(READ_VIEW), _read_sel(0),
        _read_msg_sel(0), _read_pick_expiry(0), _read_scroll(0), _read_next_scroll(0),
-       _read_scrolling(false), _read_num(0), sensors_lpp(200) {
+       _read_scrolling(false), _read_cycle_done(false), _read_num(0), sensors_lpp(200) {
     memset(&_read_target, 0, sizeof(_read_target));
   }
 
@@ -521,6 +524,15 @@ public:
   // the pickers are long lists, and are stepped through with repeated clicks
   bool wantsFastClicks() const override {
     return _page == HomePage::READ && _read_stage != READ_VIEW;
+  }
+
+  // Hold the display on once the conversation has started scrolling, so a long one can be read
+  // right through. Released when it wraps back to the top, or the page is left. The
+  // _read_cycle_done latch matters: without it the next cycle would start holding again a few
+  // seconds later and the display would never blank at all.
+  bool preventsSleep() const override {
+    return _page == HomePage::READ && _read_stage == READ_VIEW
+           && _read_scroll > 0 && !_read_cycle_done;
   }
 
   int render(DisplayDriver& display) override {
@@ -680,6 +692,7 @@ public:
           if (_read_scrolling && millis() >= _read_next_scroll) {
             if (_read_scroll >= max_scroll) {
               _read_scroll = 0;                  // wrap round to the newest message
+              _read_cycle_done = true;           // seen it all; let the display sleep again
             } else {
               _read_scroll += UI_READ_SCROLL_STEP;
               if (_read_scroll > max_scroll) _read_scroll = max_scroll;   // land on the end
@@ -1314,6 +1327,11 @@ void UITask::loop() {
       _auto_off = millis() + AUTO_OFF_MILLIS;
     }
 #endif
+    // A screen part-way through something worth watching (the message view mid-scroll) holds
+    // the deadline off, so the display doesn't blank halfway down a conversation.
+    if (curr && curr->preventsSleep()) {
+      _auto_off = millis() + AUTO_OFF_MILLIS;
+    }
     if (millis() > _auto_off) {
       _display->turnOff();
     }
