@@ -30,5 +30,9 @@ public:
   virtual bool preventsSleep() const { return false; }
   // Called when the display is woken from its auto-off blank while this screen is showing.
   virtual void onDisplayWake() { }
+  // True while an arriving message should not be allowed to replace this screen with the
+  // preview popup. For a screen that already shows the message, or that the user is part-way
+  // through using -- the message is still queued either way.
+  virtual bool suppressesMsgPreview() const { return false; }
 };
 

@@ -725,6 +725,14 @@ public:
            && _read_scrolling && _read_cycles_left > 0;
   }
 
+  // The READ page is already a view of the messages, so having one arriving throw a preview
+  // over the top of it is noise: the conversation picks the message up by itself and jumps
+  // back to the top to show it. The pickers count too -- losing the screen part-way through
+  // choosing what to read, or what to send, is the same interruption.
+  bool suppressesMsgPreview() const override {
+    return _page == HomePage::READ;
+  }
+
   // Woken from the auto-off blank. Waking part-way down a conversation means the rest of that
   // pass was missed, so cover what remains of it plus one more pass from the top; waking at
   // the top only needs the usual single pass.
@@ -1341,8 +1349,12 @@ void UITask::msgRead(int msgcount) {
 void UITask::newMsg(uint8_t path_len, const char* from_name, const char* text, int msgcount) {
   _msgcount = msgcount;
 
+  // Queue it either way, so nothing is lost and the count stays right. Whether it also takes
+  // over the display is up to whatever is currently showing.
   ((MsgPreviewScreen *) msg_preview)->addPreview(path_len, from_name, text);
-  setCurrScreen(msg_preview);
+  if (curr == NULL || !curr->suppressesMsgPreview()) {
+    setCurrScreen(msg_preview);
+  }
 
   if (_display != NULL) {
     if (!_display->isOn() && !hasConnection()) {
