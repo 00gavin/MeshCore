@@ -138,11 +138,24 @@ public:
 
   int  getRecentlyHeard(AdvertPath dest[], int max_num);
 
-  // Copy the most recent messages for one channel / contact into dest, newest first.
-  // Returns how many were copied.
-  int  getChannelHistory(uint8_t channel_idx, MsgHistoryEntry dest[], int max_num);
-  int  getContactHistory(const uint8_t* pubkey_prefix, int prefix_len, MsgHistoryEntry dest[],
+  // Bumped every time a message lands in the history ring. The UI compares it against the value
+  // it last fetched at, so a page that re-renders once a second doesn't have to keep re-reading
+  // a conversation that hasn't changed -- and gets a "something arrived" edge for free.
+  uint32_t getMsgHistoryVersion() const { return msg_history_version; }
+
+  // List the most recent messages for one channel / contact, newest first, as indices into the
+  // history ring. Returns how many were written. Indices rather than copies: the ring is the
+  // only storage there is, and callers run on the same task as the mesh loop, so nothing can be
+  // evicted between listing and reading it back.
+  int  getChannelHistory(uint8_t channel_idx, uint8_t dest[], int max_num);
+  int  getContactHistory(const uint8_t* pubkey_prefix, int prefix_len, uint8_t dest[],
                          int max_num);
+  const MsgHistoryEntry* getMsgHistoryEntry(uint8_t idx) const;
+
+  // recv_timestamp of the most recent message for one channel / contact, or 0 if it has none
+  // in the ring. Lets the UI tell which conversations have something new without listing them.
+  uint32_t getNewestMsgTime(bool is_channel, uint8_t channel_idx, const uint8_t* pubkey_prefix,
+                            int prefix_len) const;
 
 protected:
   float getAirtimeBudgetFactor() const override;
@@ -301,9 +314,12 @@ private:
 
   MsgHistoryEntry msg_history[MSG_HISTORY_SIZE];   // circular table, oldest overwritten
   int next_msg_idx;                                // where the next message will be written
+  uint32_t msg_history_version;                    // see getMsgHistoryVersion()
   MsgHistoryEntry* addMsgHistory();
-  int copyMsgHistory(bool is_channel, uint8_t channel_idx, const uint8_t* pubkey_prefix,
-                     int prefix_len, MsgHistoryEntry dest[], int max_num);
+  bool msgMatchesTarget(const MsgHistoryEntry* src, bool is_channel, uint8_t channel_idx,
+                        const uint8_t* pubkey_prefix, int prefix_len) const;
+  int listMsgHistory(bool is_channel, uint8_t channel_idx, const uint8_t* pubkey_prefix,
+                     int prefix_len, uint8_t dest[], int max_num);
 };
 
 extern MyMesh the_mesh;

@@ -73,6 +73,19 @@ static const char* const UI_SEND_MESSAGES[] = {
 // time. Half a line per step keeps the average speed close to a line every two seconds.
 #define UI_READ_SCROLL_STEP  (UI_READ_LINE_HEIGHT / 2)
 #define UI_READ_SCROLLBAR_W  2   // scrollbar down the right edge of the message view
+// How many conversations can be remembered as "read up to here", so the target picker can mark
+// the ones with something new. Only conversations actually opened need a slot, so a handful
+// covers normal use; the least recently marked is dropped when it overflows.
+#ifndef UI_READ_MARK_COUNT
+  #define UI_READ_MARK_COUNT  8
+#endif
+
+// millis() wraps around every ~49 days. Comparing the difference as a signed value keeps a
+// deadline working across the wrap, where a plain millis() >= deadline would stall until it
+// came round again.
+static inline bool uiTimePassed(unsigned long deadline) {
+  return (long)(millis() - deadline) >= 0;
+}
 
 #include "icons.h"
 
@@ -177,13 +190,35 @@ class HomeScreen : public UIScreen {
   int  _read_sel;                      // index into _targets
   int  _read_msg_sel;                  // index into UI_SEND_MESSAGES
   unsigned long _read_pick_expiry;     // when an idle picker gives up and closes
-  int  _read_scroll;                   // index of the first visible wrapped line
-  unsigned long _read_next_scroll;     // when the text next advances a line
+  int  _read_scroll;                   // how far down the conversation the view has crept, px
+  unsigned long _read_next_scroll;     // when the text next advances a step
+  bool _read_timing_set;               // _read_next_scroll holds a real deadline
   bool _read_scrolling;                // there is more text than fits, so keep re-rendering
   int  _read_cycles_left;              // full scrolls still owed before sleep is allowed again
   PickTarget _read_target;             // what is being read (lazily defaulted to Public)
-  MsgHistoryEntry _read_msgs[UI_READ_MSG_COUNT];
+  // Indices into the mesh's history ring rather than copies of the entries: an entry is a little
+  // over 200 bytes, so holding 16 of them here would cost several KB of RAM permanently, and
+  // re-copying them on every render would burn that much memcpy a second while scrolling.
+  uint8_t _read_idx[UI_READ_MSG_COUNT];
   int  _read_num;
+  uint32_t _read_version;              // history version _read_idx was built from
+  bool _read_fetched;                  // _read_idx holds a fetch for the current target
+  uint32_t _read_now;                  // the clock every displayed age is measured against
+  // Wrapped line count for the conversation as it currently reads, or -1 when it needs working
+  // out again. Only the history changing or the pinned clock moving can alter it, and both are
+  // rare next to the once-a-second re-render, so this saves a whole measuring pass per frame.
+  int  _read_total_lines;
+
+  // How far each conversation has been read, so the picker can mark the ones with something
+  // newer. Oldest mark is recycled once the table is full.
+  struct ReadMark {
+    uint8_t  pubkey_prefix[7];
+    uint8_t  channel_idx;
+    bool     is_channel;
+    bool     used;
+    uint32_t seen;                     // recv_timestamp of the newest message shown
+  };
+  ReadMark _read_marks[UI_READ_MARK_COUNT];
 
   // How long the current line stays put. Both ends of the conversation dwell longer than the
   // lines in between: the top so the newest message can be read without catching it
@@ -194,13 +229,28 @@ class HomeScreen : public UIScreen {
     return UI_READ_SCROLL_MILLIS;
   }
 
+  // Pin the clock that the displayed ages are worked out from. They are only allowed to move
+  // when the view is back at the top: an age is part of the text, so letting it tick while the
+  // conversation is part-way through a pass would re-wrap lines under the reader -- "59s"
+  // becoming "1m" is a character shorter, and that is enough to pull a word onto another line.
+  void readSyncClock() {
+    _read_now = _rtc->getCurrentTime();
+    _read_total_lines = -1;   // the ages are part of the text, so the wrapping may have moved
+  }
+
   // back to the top, and hold there before scrolling starts. Arriving fresh on the page (or
   // switching conversation) earns another uninterrupted scroll through.
   void readRestart() {
     _read_scroll = 0;
     _read_cycles_left = 1;
     _read_next_scroll = millis() + UI_READ_TOP_MILLIS;
+    _read_timing_set = true;
+    readSyncClock();
   }
+
+  // Throw away the current fetch, so the next render rebuilds it. Used when the conversation
+  // being read changes, where the history itself hasn't moved but the selection has.
+  void readInvalidate() { _read_fetched = false; }
 
   int targetRows() const { return _num_targets; }
   int sendMsgRows() const { return UI_SEND_NUM_MESSAGES; }
@@ -229,39 +279,139 @@ class HomeScreen : public UIScreen {
       _read_target.is_channel = true;
       _read_target.channel_idx = i;
       StrHelper::strncpy(_read_target.name, ch.name, sizeof(_read_target.name));
+      // the channels arrive after the first few renders, so an earlier fetch will have come
+      // back empty against no target at all -- it has to be redone now there is one
+      readInvalidate();
       return;
     }
     // no channels configured at all -- leave the target unset, the page shows "No messages"
   }
 
+  // Rebuild the list of messages to show, but only when there is a reason to. The history
+  // version only moves when a message is added, so a page re-rendering once a second while
+  // scrolling normally does no work here at all.
   void readFetch() {
     readEnsureTarget();
+
+    uint32_t version = the_mesh.getMsgHistoryVersion();
+    if (_read_fetched && version == _read_version) return;
+    bool arrived = _read_fetched;   // a change, rather than the first look at this conversation
+    _read_version = version;
+    _read_fetched = true;
+    if (!arrived) readSyncClock();   // first sight of it, so there is no pass to disturb
+
     if (_read_target.name[0] == 0) {
       _read_num = 0;
     } else if (_read_target.is_channel) {
-      _read_num = the_mesh.getChannelHistory(_read_target.channel_idx, _read_msgs,
+      _read_num = the_mesh.getChannelHistory(_read_target.channel_idx, _read_idx,
                                              UI_READ_MSG_COUNT);
     } else {
       _read_num = the_mesh.getContactHistory(_read_target.pubkey_prefix,
                                              sizeof(_read_target.pubkey_prefix),
-                                             _read_msgs, UI_READ_MSG_COUNT);
+                                             _read_idx, UI_READ_MSG_COUNT);
     }
+
+    _read_total_lines = -1;   // different messages, so the line count has to be redone
+
+    // Looking at a conversation is what marks it read, so do it on every rebuild -- both the
+    // first sight of it and each message that lands while it is on screen.
+    readMarkSeen();
+
+    // Messages come out newest-first, so one arriving is inserted at the top and pushes
+    // everything below it down the screen. Left alone, the text the user was part-way through
+    // reading would slide out from under the scroll position; going back to the top instead
+    // keeps the view honest and shows what just came in.
+    if (arrived) readRestart();
+  }
+
+  // Find the mark for a conversation, or NULL. Channels and contacts never collide: a mark is
+  // one or the other, and is only compared against its own kind.
+  ReadMark* readFindMark(const PickTarget& t) {
+    for (int i = 0; i < UI_READ_MARK_COUNT; i++) {
+      auto m = &_read_marks[i];
+      if (!m->used || m->is_channel != t.is_channel) continue;
+      if (t.is_channel) {
+        if (m->channel_idx == t.channel_idx) return m;
+      } else if (memcmp(m->pubkey_prefix, t.pubkey_prefix, sizeof(m->pubkey_prefix)) == 0) {
+        return m;
+      }
+    }
+    return NULL;
+  }
+
+  // Record that the conversation now being read has been seen up to its newest message, so the
+  // picker stops marking it. Recycles the stalest mark when the table is full.
+  void readMarkSeen() {
+    if (_read_target.name[0] == 0) return;
+
+    uint32_t newest = the_mesh.getNewestMsgTime(_read_target.is_channel,
+                                                _read_target.channel_idx,
+                                                _read_target.pubkey_prefix,
+                                                sizeof(_read_target.pubkey_prefix));
+    if (newest == 0) return;   // nothing in the ring for it
+
+    auto mark = readFindMark(_read_target);
+    if (mark == NULL) {
+      mark = &_read_marks[0];
+      for (int i = 1; i < UI_READ_MARK_COUNT; i++) {
+        if (!_read_marks[i].used) { mark = &_read_marks[i]; break; }
+        if (_read_marks[i].seen < mark->seen) mark = &_read_marks[i];
+      }
+      memset(mark, 0, sizeof(*mark));
+      mark->used = true;
+      mark->is_channel = _read_target.is_channel;
+      mark->channel_idx = _read_target.channel_idx;
+      memcpy(mark->pubkey_prefix, _read_target.pubkey_prefix, sizeof(mark->pubkey_prefix));
+    }
+    mark->seen = newest;
+  }
+
+  // Has this conversation had a message since it was last read? A conversation never opened
+  // counts as unread, so long as it has something in it to read.
+  bool readHasUnread(const PickTarget& t) {
+    uint32_t newest = the_mesh.getNewestMsgTime(t.is_channel, t.channel_idx, t.pubkey_prefix,
+                                                sizeof(t.pubkey_prefix));
+    if (newest == 0) return false;
+
+    auto mark = readFindMark(t);
+    return mark == NULL || newest > mark->seen;
   }
 
   // Length of the longest prefix of str that fits in max_width, broken at a space where one is
   // available so words are not split. Always returns >= 1 so the caller cannot loop forever.
-  int readWrapPoint(DisplayDriver& display, const char* str, int max_width) {
-    char tmp[64];
+  // Measures in place, putting the terminator back afterwards, rather than copying each prefix
+  // into a scratch buffer: that buffer used to cap a line at its own length regardless of how
+  // much the display could actually fit, which showed up as early wrapping on the wider TFTs.
+  int readWrapPoint(DisplayDriver& display, char* str, int max_width) {
     int fits = 0, last_space = 0;
-    for (int n = 1; n < (int)sizeof(tmp) && str[n - 1] != 0; n++) {
-      memcpy(tmp, str, n);
-      tmp[n] = 0;
-      if ((int)display.getTextWidth(tmp) > max_width) break;
+    for (int n = 1; str[n - 1] != 0; n++) {
+      char saved = str[n];
+      str[n] = 0;
+      bool too_wide = ((int)display.getTextWidth(str) > max_width);
+      str[n] = saved;
+      if (too_wide) break;
       fits = n;
       if (str[n - 1] == ' ') last_space = n;
     }
     if (str[fits] != 0 && last_space > 0) return last_space;   // would split a word
     return fits > 0 ? fits : 1;
+  }
+
+  // How long ago a message arrived, in the same shorthand the unread preview screen uses.
+  // Measured against the pinned clock, not the live one -- see readSyncClock().
+  void readFormatAge(char* dest, size_t dest_size, uint32_t recv_timestamp) {
+    // The clock can be stepped backwards by a time sync, leaving a message "in the future"
+    uint32_t secs = (_read_now > recv_timestamp) ? (_read_now - recv_timestamp) : 0;
+
+    if (secs < 60) {
+      snprintf(dest, dest_size, "%us", (unsigned) secs);
+    } else if (secs < 60*60) {
+      snprintf(dest, dest_size, "%um", (unsigned) (secs / 60));
+    } else if (secs < 24*60*60) {
+      snprintf(dest, dest_size, "%uh", (unsigned) (secs / (60*60)));
+    } else {
+      snprintf(dest, dest_size, "%ud", (unsigned) (secs / (24*60*60)));
+    }
   }
 
   // Width available to text. The scrollbar gutter is reserved whether or not the bar is
@@ -293,35 +443,51 @@ class HomeScreen : public UIScreen {
   // Pass draw = false to count the lines without rendering. Scrolling is by pixels, so the
   // line at the top is usually part-way off screen; the display driver clips it.
   int readDrawLines(DisplayDriver& display, int scroll_px, bool draw) {
-    char composed[sizeof(_read_msgs[0].sender) + sizeof(_read_msgs[0].text) + 4];
+    // room for the longest message, the sender, and the age prefix in front of both
+    char composed[sizeof(MsgHistoryEntry::sender) + sizeof(MsgHistoryEntry::text) + 16];
     char shown[sizeof(composed)];
+    char age[12];
     int line = 0;
 
     for (int m = 0; m < _read_num; m++) {
-      auto msg = &_read_msgs[m];
+      auto msg = the_mesh.getMsgHistoryEntry(_read_idx[m]);
+      if (msg == NULL) continue;
+
+      readFormatAge(age, sizeof(age), msg->recv_timestamp);
       // channel payloads already lead with "<sender>: "; DMs need the contact name prepended
       if (msg->sender[0] != 0) {
-        snprintf(composed, sizeof(composed), "%s: %s", msg->sender, msg->text);
+        snprintf(composed, sizeof(composed), "%s %s: %s", age, msg->sender, msg->text);
       } else {
-        StrHelper::strncpy(composed, msg->text, sizeof(composed));
+        snprintf(composed, sizeof(composed), "%s %s", age, msg->text);
       }
-      display.translateUTF8ToBlocks(shown, composed, sizeof(shown));
 
-      for (const char* p = shown; *p; ) {
-        int n = readWrapPoint(display, p, readTextWidth(display));
-        int y = line * UI_READ_LINE_HEIGHT - scroll_px;
-        if (draw && y > -UI_READ_LINE_HEIGHT && y < display.height()) {
-          char row[64];
-          int len = (n < (int)sizeof(row) - 1) ? n : (int)sizeof(row) - 1;
-          memcpy(row, p, len);
-          row[len] = 0;
-          display.setColor(UIColor::primary_txt);
-          display.setCursor(0, y);
-          display.print(row);
+      // A message can carry newlines, and translateUTF8ToBlocks drops anything outside printable
+      // ASCII -- which used to run the words either side of a break together. Wrap each line of
+      // the message separately instead, so the break is kept as a break.
+      for (char* seg = composed; seg != NULL; ) {
+        char* brk = strchr(seg, '\n');
+        if (brk != NULL) *brk = 0;
+        display.translateUTF8ToBlocks(shown, seg, sizeof(shown));
+        seg = (brk != NULL) ? brk + 1 : NULL;
+
+        for (char* p = shown; ; ) {
+          if (*p == 0) { line++; break; }   // a blank line in the message still takes a row
+
+          int n = readWrapPoint(display, p, readTextWidth(display));
+          int y = line * UI_READ_LINE_HEIGHT - scroll_px;
+          if (draw && y > -UI_READ_LINE_HEIGHT && y < display.height()) {
+            char saved = p[n];
+            p[n] = 0;
+            display.setColor(UIColor::primary_txt);
+            display.setCursor(0, y);
+            display.print(p);
+            p[n] = saved;
+          }
+          line++;
+          p += n;
+          while (*p == ' ') p++;   // don't start the next line on the break space
+          if (*p == 0) break;
         }
-        line++;
-        p += n;
-        while (*p == ' ') p++;   // don't start the next line on the break space
       }
     }
     return line;
@@ -357,12 +523,29 @@ class HomeScreen : public UIScreen {
     }
   }
 
-  // one row of a picker list: '>' marker on the selection, name ellipsized to fit
-  void drawPickerRow(DisplayDriver& display, int y, bool is_sel, const char* text) {
+  // one row of a picker list: '>' marker on the selection, name ellipsized to fit, and an
+  // optional '*' after it for a conversation with something unread in it
+  void drawPickerRow(DisplayDriver& display, int y, bool is_sel, const char* text,
+                     bool unread = false) {
     display.setColor(is_sel ? UIColor::warning_txt : UIColor::secondary_txt);
     display.setCursor(0, y);
     display.print(is_sel ? ">" : " ");
-    display.drawTextEllipsized(8, y, display.width() - 8, text);
+
+    int right = display.width();
+    if (unread) {
+      int w = display.getTextWidth("*");
+      display.setCursor(right - w, y);
+      display.print("*");
+      right -= w + 2;
+    }
+    display.drawTextEllipsized(8, y, right - 8, text);
+  }
+
+  // Do two picker entries name the same conversation?
+  bool targetsMatch(const PickTarget& a, const PickTarget& b) const {
+    if (a.is_channel != b.is_channel) return false;
+    if (a.is_channel) return a.channel_idx == b.channel_idx;
+    return memcmp(a.pubkey_prefix, b.pubkey_prefix, sizeof(a.pubkey_prefix)) == 0;
   }
 
   bool targetAlreadyListed(const uint8_t* pub_key) const {
@@ -509,8 +692,11 @@ public:
      : _task(task), _rtc(rtc), _sensors(sensors), _node_prefs(node_prefs), _page(0),
        _shutdown_init(false), _num_targets(0), _read_stage(READ_VIEW), _read_sel(0),
        _read_msg_sel(0), _read_pick_expiry(0), _read_scroll(0), _read_next_scroll(0),
-       _read_scrolling(false), _read_cycles_left(1), _read_num(0), sensors_lpp(200) {
+       _read_timing_set(false), _read_scrolling(false), _read_cycles_left(1), _read_num(0),
+       _read_version(0), _read_fetched(false), _read_now(0), _read_total_lines(-1),
+       sensors_lpp(200) {
     memset(&_read_target, 0, sizeof(_read_target));
+    memset(_read_marks, 0, sizeof(_read_marks));
   }
 
   void poll() override {
@@ -519,7 +705,7 @@ public:
     }
     // With multi-click off there is no back gesture inside the pickers, and long-press in the
     // message picker sends -- so idling out is the way to leave without acting.
-    if (_read_stage != READ_VIEW && millis() >= _read_pick_expiry) {
+    if (_read_stage != READ_VIEW && uiTimePassed(_read_pick_expiry)) {
       _read_stage = READ_VIEW;
     }
   }
@@ -531,10 +717,12 @@ public:
 
   // Hold the display on while the conversation is part-way through a scroll it still owes the
   // user. The counter matters: without it a fresh cycle would start holding again seconds
-  // after the last one ended, and the display would never blank at all.
+  // after the last one ended, and the display would never blank at all. The hold covers the
+  // pause at the top as well as the scroll itself -- keying it off the scroll position instead
+  // let the display blank during that first pause, before a word of the page had moved.
   bool preventsSleep() const override {
     return _page == HomePage::READ && _read_stage == READ_VIEW
-           && _read_scroll > 0 && _read_cycles_left > 0;
+           && _read_scrolling && _read_cycles_left > 0;
   }
 
   // Woken from the auto-off blank. Waking part-way down a conversation means the rest of that
@@ -673,7 +861,7 @@ public:
         int y = 20;
         for (int i = first; i < targetRows() && i < first + UI_PICK_VISIBLE_ROWS; i++, y += 11) {
           display.translateUTF8ToBlocks(label, _targets[i].name, sizeof(label));
-          drawPickerRow(display, y, i == _read_sel, label);
+          drawPickerRow(display, y, i == _read_sel, label, readHasUnread(_targets[i]));
         }
       } else if (_read_stage == READ_PICK_MSG) {
         int first = pickerWindowStart(_read_msg_sel, sendMsgRows(), UI_PICK_VISIBLE_ROWS);
@@ -690,19 +878,31 @@ public:
                                    "No messages");
         } else {
           // Measure the text first, so scrolling can stop once the last line sits on the
-          // bottom of the screen -- going further would just pull blank space into view.
-          int total_px = readDrawLines(display, 0, false) * UI_READ_LINE_HEIGHT;
+          // bottom of the screen -- going further would just pull blank space into view. The
+          // count is cached, since re-wrapping every message is the expensive part of a render
+          // and nothing about the text changes between the events that clear it.
+          if (_read_total_lines < 0) _read_total_lines = readDrawLines(display, 0, false);
+          int total_px = _read_total_lines * UI_READ_LINE_HEIGHT;
           int max_scroll = total_px - display.height();
           if (max_scroll < 0) max_scroll = 0;   // it all fits: nothing to scroll
 
           // first render since boot: hold at the top for a full interval before scrolling
-          if (_read_next_scroll == 0) _read_next_scroll = millis() + readHoldMillis(max_scroll);
+          if (!_read_timing_set) {
+            _read_next_scroll = millis() + readHoldMillis(max_scroll);
+            _read_timing_set = true;
+          }
 
           _read_scrolling = (max_scroll > 0);
-          if (_read_scrolling && millis() >= _read_next_scroll) {
+          if (uiTimePassed(_read_next_scroll)) {
             if (_read_scroll >= max_scroll) {
+              // Back at the top of the conversation, so the ages are free to move on without
+              // disturbing anything. A conversation short enough not to scroll sits here
+              // permanently, and gets its ages refreshed once per hold instead.
               _read_scroll = 0;                  // wrap round to the newest message
-              if (_read_cycles_left > 0) _read_cycles_left--;   // that pass is now paid off
+              readSyncClock();
+              if (_read_scrolling && _read_cycles_left > 0) {
+                _read_cycles_left--;             // that pass is now paid off
+              }
             } else {
               _read_scroll += UI_READ_SCROLL_STEP;
               if (_read_scroll > max_scroll) _read_scroll = max_scroll;   // land on the end
@@ -865,6 +1065,7 @@ public:
         _read_stage = READ_VIEW;
       } else if (c == KEY_ENTER) {   // long press -> read the selected conversation
         _read_target = _targets[_read_sel];
+        readInvalidate();   // different conversation, so the fetch has to be redone
         readRestart();
         // the message view has no title bar, so confirm the switch here instead
         char alert[48];
@@ -935,7 +1136,12 @@ public:
       if (_num_targets == 0) {
         _task->showAlert("Nothing to read", 1200);
       } else {
+        // open on the conversation being read, so stepping off it is a deliberate act rather
+        // than something the user has to walk back to the top of the list to undo
         _read_sel = 0;
+        for (int i = 0; i < _num_targets; i++) {
+          if (targetsMatch(_targets[i], _read_target)) { _read_sel = i; break; }
+        }
         _read_pick_expiry = millis() + UI_PICK_TIMEOUT_MILLIS;
         _read_stage = READ_PICK_TARGET;
       }

@@ -394,37 +394,61 @@ void MyMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path
 MsgHistoryEntry* MyMesh::addMsgHistory() {
   auto dest = &msg_history[next_msg_idx];
   next_msg_idx = (next_msg_idx + 1) % MSG_HISTORY_SIZE;
+  msg_history_version++;
 
   memset(dest, 0, sizeof(*dest));
   dest->recv_timestamp = getRTCClock()->getCurrentTime();
   return dest;
 }
 
+// Is this entry part of the given conversation? A zero timestamp means the slot has never been
+// written -- the RTC is seeded to a date in the past at boot, so a real message never reads 0.
+bool MyMesh::msgMatchesTarget(const MsgHistoryEntry* src, bool is_channel, uint8_t channel_idx,
+                              const uint8_t* pubkey_prefix, int prefix_len) const {
+  if (src->recv_timestamp == 0) return false;
+  if (src->is_channel != is_channel) return false;
+  if (is_channel) return src->channel_idx == channel_idx;
+  return memcmp(src->pubkey_prefix, pubkey_prefix, prefix_len) == 0;
+}
+
 // Walk the ring backwards from the write cursor, so dest comes out newest-first.
-int MyMesh::copyMsgHistory(bool is_channel, uint8_t channel_idx, const uint8_t* pubkey_prefix,
-                           int prefix_len, MsgHistoryEntry dest[], int max_num) {
+int MyMesh::listMsgHistory(bool is_channel, uint8_t channel_idx, const uint8_t* pubkey_prefix,
+                           int prefix_len, uint8_t dest[], int max_num) {
   int num = 0;
   for (int n = 1; n <= MSG_HISTORY_SIZE && num < max_num; n++) {
-    auto src = &msg_history[(next_msg_idx - n + MSG_HISTORY_SIZE) % MSG_HISTORY_SIZE];
-    if (src->recv_timestamp == 0) continue;         // never written
-    if (src->is_channel != is_channel) continue;
-    if (is_channel) {
-      if (src->channel_idx != channel_idx) continue;
-    } else {
-      if (memcmp(src->pubkey_prefix, pubkey_prefix, prefix_len) != 0) continue;
-    }
-    dest[num++] = *src;
+    int idx = (next_msg_idx - n + MSG_HISTORY_SIZE) % MSG_HISTORY_SIZE;
+    if (!msgMatchesTarget(&msg_history[idx], is_channel, channel_idx, pubkey_prefix,
+                          prefix_len)) continue;
+    dest[num++] = (uint8_t) idx;
   }
   return num;
 }
 
-int MyMesh::getChannelHistory(uint8_t channel_idx, MsgHistoryEntry dest[], int max_num) {
-  return copyMsgHistory(true, channel_idx, NULL, 0, dest, max_num);
+int MyMesh::getChannelHistory(uint8_t channel_idx, uint8_t dest[], int max_num) {
+  return listMsgHistory(true, channel_idx, NULL, 0, dest, max_num);
 }
 
 int MyMesh::getContactHistory(const uint8_t* pubkey_prefix, int prefix_len,
-                              MsgHistoryEntry dest[], int max_num) {
-  return copyMsgHistory(false, 0, pubkey_prefix, prefix_len, dest, max_num);
+                              uint8_t dest[], int max_num) {
+  return listMsgHistory(false, 0, pubkey_prefix, prefix_len, dest, max_num);
+}
+
+const MsgHistoryEntry* MyMesh::getMsgHistoryEntry(uint8_t idx) const {
+  if (idx >= MSG_HISTORY_SIZE) return NULL;
+  return &msg_history[idx];
+}
+
+// The ring is small, so the newest entry for one conversation is cheapest to find by just
+// walking it backwards and stopping at the first match.
+uint32_t MyMesh::getNewestMsgTime(bool is_channel, uint8_t channel_idx,
+                                  const uint8_t* pubkey_prefix, int prefix_len) const {
+  for (int n = 1; n <= MSG_HISTORY_SIZE; n++) {
+    auto src = &msg_history[(next_msg_idx - n + MSG_HISTORY_SIZE) % MSG_HISTORY_SIZE];
+    if (msgMatchesTarget(src, is_channel, channel_idx, pubkey_prefix, prefix_len)) {
+      return src->recv_timestamp;
+    }
+  }
+  return 0;
 }
 
 static int sort_by_recent(const void *a, const void *b) {
@@ -924,6 +948,7 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   dirty_contacts_expiry = 0;
   memset(advert_paths, 0, sizeof(advert_paths));
   next_msg_idx = 0;
+  msg_history_version = 0;
   memset(msg_history, 0, sizeof(msg_history));
   memset(send_scope.key, 0, sizeof(send_scope.key));
   send_unscoped = false;
