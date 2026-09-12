@@ -204,6 +204,7 @@ class HomeScreen : public UIScreen {
   uint32_t _read_version;              // history version _read_idx was built from
   bool _read_fetched;                  // _read_idx holds a fetch for the current target
   uint32_t _read_now;                  // the clock every displayed age is measured against
+  int  _read_top_idx;                  // ring slot of the newest message shown, -1 when none
   // Wrapped line count for the conversation as it currently reads, or -1 when it needs working
   // out again. Only the history changing or the pinned clock moving can alter it, and both are
   // rare next to the once-a-second re-render, so this saves a whole measuring pass per frame.
@@ -296,6 +297,7 @@ class HomeScreen : public UIScreen {
     uint32_t version = the_mesh.getMsgHistoryVersion();
     if (_read_fetched && version == _read_version) return;
     bool arrived = _read_fetched;   // a change, rather than the first look at this conversation
+    int prev_top = _read_top_idx;
     _read_version = version;
     _read_fetched = true;
     if (!arrived) readSyncClock();   // first sight of it, so there is no pass to disturb
@@ -311,17 +313,25 @@ class HomeScreen : public UIScreen {
                                              _read_idx, UI_READ_MSG_COUNT);
     }
 
-    _read_total_lines = -1;   // different messages, so the line count has to be redone
+    // Another conversation's message can still evict this one's oldest entry, so the line
+    // count has to be redone whether or not anything was added at the top.
+    _read_total_lines = -1;
+    _read_top_idx = (_read_num > 0) ? (int) _read_idx[0] : -1;
 
     // Looking at a conversation is what marks it read, so do it on every rebuild -- both the
     // first sight of it and each message that lands while it is on screen.
     readMarkSeen();
 
-    // Messages come out newest-first, so one arriving is inserted at the top and pushes
-    // everything below it down the screen. Left alone, the text the user was part-way through
-    // reading would slide out from under the scroll position; going back to the top instead
-    // keeps the view honest and shows what just came in.
-    if (arrived) readRestart();
+    // Messages come out newest-first, so one arriving in this conversation is inserted at the
+    // top and pushes everything below it down the screen. Left alone, the text the user was
+    // part-way through reading would slide out from under the scroll position; going back to
+    // the top instead keeps the view honest and shows what just came in.
+    //
+    // Only a message in the conversation on screen counts. The history is shared by every
+    // channel and contact, so the version moves for everything the node hears -- and being
+    // thrown back to the top because someone spoke in another channel is exactly the
+    // interruption this page is meant to avoid. A new entry at the head is the tell.
+    if (arrived && _read_top_idx != prev_top) readRestart();
   }
 
   // Find the mark for a conversation, or NULL. Channels and contacts never collide: a mark is
@@ -693,8 +703,8 @@ public:
        _shutdown_init(false), _num_targets(0), _read_stage(READ_VIEW), _read_sel(0),
        _read_msg_sel(0), _read_pick_expiry(0), _read_scroll(0), _read_next_scroll(0),
        _read_timing_set(false), _read_scrolling(false), _read_cycles_left(1), _read_num(0),
-       _read_version(0), _read_fetched(false), _read_now(0), _read_total_lines(-1),
-       sensors_lpp(200) {
+       _read_version(0), _read_fetched(false), _read_now(0), _read_top_idx(-1),
+       _read_total_lines(-1), sensors_lpp(200) {
     memset(&_read_target, 0, sizeof(_read_target));
     memset(_read_marks, 0, sizeof(_read_marks));
   }
