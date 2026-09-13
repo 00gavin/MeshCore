@@ -1252,6 +1252,17 @@ void MyMesh::handleCmdFrame(size_t len) {
           next_ack_idx = (next_ack_idx + 1) % EXPECTED_ACK_TABLE_SIZE;
         }
 
+#ifdef DISPLAY_CLASS
+        // Keep a copy for the READ page, the same as a message sent from the device itself:
+        // sending through the app is otherwise invisible on the screen. Filed under the
+        // recipient's key, not ours, so both directions land in the one conversation. CLI data
+        // is left out -- that is a command to another node, not part of a conversation.
+        if (txt_type == TXT_TYPE_PLAIN) {
+          auto h = addMsgHistory(_prefs.node_name, text);
+          if (h) memcpy(h->pubkey_prefix, recipient->id.pub_key, sizeof(h->pubkey_prefix));
+        }
+#endif
+
         out_frame[0] = RESP_CODE_SENT;
         out_frame[1] = (result == MSG_SEND_SENT_FLOOD) ? 1 : 0;
         memcpy(&out_frame[2], &expected_ack, 4);
@@ -1278,6 +1289,17 @@ void MyMesh::handleCmdFrame(size_t len) {
       ChannelDetails channel;
       bool success = getChannel(channel_idx, channel);
       if (success && sendGroupMessage(msg_timestamp, channel.channel, _prefs.node_name, text, len - i)) {
+#ifdef DISPLAY_CLASS
+        // Keep a copy for the READ page, as sendTextToChannelIdx() does for a message sent from
+        // the device itself. Our own name goes in the sender field rather than being pasted onto
+        // the front of the text -- that is the shape the reader expects for a message we sent.
+        cmd_frame[len] = 0;   // the frame carries the text unterminated; the buffer has the spare byte
+        auto h = addMsgHistory(_prefs.node_name, text);
+        if (h) {
+          h->is_channel = true;
+          h->channel_idx = channel_idx;
+        }
+#endif
         writeOKFrame();
       } else {
         writeErrFrame(ERR_CODE_NOT_FOUND); // bad channel_idx
