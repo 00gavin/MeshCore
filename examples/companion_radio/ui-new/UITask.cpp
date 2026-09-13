@@ -48,7 +48,12 @@ static const char* const UI_SEND_MESSAGES[] = {
 #ifndef UI_TARGET_RECENT_MAX
   #define UI_TARGET_RECENT_MAX  8
 #endif
-#define UI_PICK_VISIBLE_ROWS  4   // rows that fit under the title bar
+// Picker rows start below the title bar and step down by the line spacing the rest of the UI
+// uses. How many are shown comes from the display height rather than being fixed: four is all a
+// 64px OLED has room for, but the taller e-ink panels were showing four and leaving the rest of
+// the screen blank.
+#define UI_PICK_FIRST_ROW_Y   20
+#define UI_PICK_ROW_HEIGHT    11
 #ifndef UI_PICK_TIMEOUT_MILLIS
   #define UI_PICK_TIMEOUT_MILLIS  8000   // close an idle picker without acting on it
 #endif
@@ -255,6 +260,13 @@ class HomeScreen : public UIScreen {
 
   int targetRows() const { return _num_targets; }
   int sendMsgRows() const { return UI_SEND_NUM_MESSAGES; }
+
+  // Whole picker rows that fit under the title bar on this display. At least one, so a very
+  // short screen still shows the selection rather than nothing at all.
+  int pickerVisibleRows(DisplayDriver& display) const {
+    int rows = (display.height() - UI_PICK_FIRST_ROW_Y) / UI_PICK_ROW_HEIGHT;
+    return rows > 1 ? rows : 1;
+  }
 
   // First row to draw in a picker window. The selection is kept one row up from the bottom
   // where there is room, so the entry coming next is already on screen, and the window never
@@ -877,19 +889,20 @@ public:
     } else if (_page == HomePage::READ) {
       _read_scrolling = false;
       char label[sizeof(_targets[0].name)];
+      int rows = pickerVisibleRows(display);
       if (_read_stage == READ_PICK_TARGET) {
-        int first = pickerWindowStart(_read_sel, targetRows(), UI_PICK_VISIBLE_ROWS);
+        int first = pickerWindowStart(_read_sel, targetRows(), rows);
 
-        int y = 20;
-        for (int i = first; i < targetRows() && i < first + UI_PICK_VISIBLE_ROWS; i++, y += 11) {
+        int y = UI_PICK_FIRST_ROW_Y;
+        for (int i = first; i < targetRows() && i < first + rows; i++, y += UI_PICK_ROW_HEIGHT) {
           display.translateUTF8ToBlocks(label, _targets[i].name, sizeof(label));
           drawPickerRow(display, y, i == _read_sel, label, readHasUnread(_targets[i]));
         }
       } else if (_read_stage == READ_PICK_MSG) {
-        int first = pickerWindowStart(_read_msg_sel, sendMsgRows(), UI_PICK_VISIBLE_ROWS);
+        int first = pickerWindowStart(_read_msg_sel, sendMsgRows(), rows);
 
-        int y = 20;
-        for (int i = first; i < sendMsgRows() && i < first + UI_PICK_VISIBLE_ROWS; i++, y += 11) {
+        int y = UI_PICK_FIRST_ROW_Y;
+        for (int i = first; i < sendMsgRows() && i < first + rows; i++, y += UI_PICK_ROW_HEIGHT) {
           drawPickerRow(display, y, i == _read_msg_sel, UI_SEND_MESSAGES[i]);
         }
       } else {
