@@ -34,6 +34,8 @@ class GxEPDDisplay : public DisplayDriver {
   bool _init = false;
   bool _isOn = false;
   uint16_t _curr_color;
+  uint8_t _line_height = 0;   // yAdvance of the current font, in display pixels
+  int _cursor_x = 0, _cursor_y = 0;
   CRC32 display_crc;
   int last_display_crc_value = 0;
 
@@ -56,6 +58,7 @@ public:
   void setColor(ColorVal c) override;
   void setCursor(int x, int y) override;
   void print(const char* str) override;
+  void printWordWrap(const char* str, int max_width) override;
   void fillRect(int x, int y, int w, int h) override;
   void drawRect(int x, int y, int w, int h) override;
   void drawXbm(int x, int y, const uint8_t* bits, int w, int h) override;

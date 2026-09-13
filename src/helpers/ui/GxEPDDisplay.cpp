@@ -35,6 +35,12 @@ bool GxEPDDisplay::begin() {
 #endif
   display.init(115200, true, 2, false);
   display.setRotation(DISPLAY_ROTATION);
+  // Adafruit_GFX wraps text at the right edge by itself, which this UI does not want: it lays
+  // its own lines out, so an over-long line was wrapped back to x=0 one font-height down, on top
+  // of whatever was drawn on the next row. Worse, getTextBounds() honours the same flag, so a
+  // long string measured as no wider than the screen and callers doing their own wrapping (the
+  // message reader) never saw a line that needed breaking. Measure and draw unwrapped instead.
+  display.setTextWrap(false);
   setTextSize(1);  // Default to size 1
   display.setPartialWindow(0, 0, display.width(), display.height());
 
@@ -81,20 +87,25 @@ void GxEPDDisplay::startFrame(ColorVal bkg) {
 
 void GxEPDDisplay::setTextSize(int sz) {
   display_crc.update<int>(sz);
+  const GFXfont* font;
   switch(sz) {
     case 1:  // Small
-      display.setFont(&FreeSans9pt7b);
+      font = &FreeSans9pt7b;
       break;
     case 2:  // Medium Bold
-      display.setFont(&FreeSansBold12pt7b);
+      font = &FreeSansBold12pt7b;
       break;
     case 3:  // Large
-      display.setFont(&FreeSans18pt7b);
+      font = &FreeSans18pt7b;
       break;
     default:
-      display.setFont(&FreeSans9pt7b);
+      font = &FreeSans9pt7b;
       break;
   }
+  display.setFont(font);
+  // kept for printWordWrap(): the font is only reachable through Adafruit_GFX's protected
+  // members, so note its line spacing here, where the font is chosen
+  _line_height = pgm_read_byte(&font->yAdvance);
 }
 
 void GxEPDDisplay::setColor(ColorVal c) {
@@ -105,12 +116,48 @@ void GxEPDDisplay::setColor(ColorVal c) {
 void GxEPDDisplay::setCursor(int x, int y) {
   display_crc.update<int>(x);
   display_crc.update<int>(y);
+  _cursor_x = x;
+  _cursor_y = y;
   display.setCursor((x+offset_x)*scale_x, (y+offset_y)*scale_y);
 }
 
 void GxEPDDisplay::print(const char* str) {
   display_crc.update<char>(str, strlen(str));
   display.print(str);
+}
+
+// Print str broken into lines no wider than max_width, starting at the current cursor. Breaks at
+// the last space that fits, or mid-word when a single word is too long for a line on its own.
+// Needed because Adafruit_GFX's own wrapping is switched off in begin(), and because that
+// wrapping went by the physical screen edge rather than the width the caller asked for.
+void GxEPDDisplay::printWordWrap(const char* str, int max_width) {
+  char line[96];
+  int x = _cursor_x, y = _cursor_y;
+  int avail = max_width - x;
+  if (avail < 1) return;
+
+  int line_h = (int)ceil(_line_height / scale_y);
+  for (const char* p = str; *p != 0 && y < height(); ) {
+    size_t fits = 0, last_space = 0;
+    for (size_t n = 1; n < sizeof(line) && p[n - 1] != 0; n++) {
+      memcpy(line, p, n);
+      line[n] = 0;
+      if ((int)getTextWidth(line) > avail) break;
+      fits = n;
+      if (p[n - 1] == ' ') last_space = n;
+    }
+    // take the whole prefix that fits, unless stopping there would split a word
+    size_t take = (p[fits] != 0 && last_space > 0) ? last_space : (fits > 0 ? fits : 1);
+
+    memcpy(line, p, take);
+    line[take] = 0;
+    setCursor(x, y);
+    print(line);
+
+    p += take;
+    while (*p == ' ') p++;   // don't start the next line on the break space
+    y += line_h;
+  }
 }
 
 void GxEPDDisplay::fillRect(int x, int y, int w, int h) {
